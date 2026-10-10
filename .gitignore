@@ -1,0 +1,38 @@
+# Portable runtime and large local assets
+runtime/
+packages/
+bin/
+gguf/
+model_embedding/
+model_reranker/
+
+# Vendored Windows binaries; tools/check_airgap.py stays tracked.
+tools/poppler/
+
+# User data and generated files
+database/
+output/
+temp/
+backup/
+logs/
+config/
+*.log
+*.db
+*.db-wal
+*.db-shm
+
+# UI audit screenshots — regenerated on demand, may contain document content
+artifacts/
+
+# Agent workspace: session worktrees and machine-specific launch config
+.claude/
+
+# Python/editor caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# Local scratch files
+~/
+_gpu_result.txt

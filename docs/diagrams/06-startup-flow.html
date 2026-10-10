@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="sketch-size" content="1600x1200">
+<title>OCR VBHC — Khởi động</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Pangolin&family=Patrick+Hand&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="sketch.css">
+<script src="https://cdn.jsdelivr.net/npm/roughjs@4.6.6/bundled/rough.js" integrity="sha384-1NLkwxMO2sOqcq7rQkFBhIAUJtbt8ziLxhVKVgKfFGMEU8pF+GEq5LVogviveup6" crossorigin="anonymous"></script>
+<script src="sketch.js"></script>
+</head>
+<body>
+<div id="board"></div>
+<script>
+Sketch.draw({
+  width: 1600, height: 1200,
+  title: "Mở ứng dụng trong một nhịp",
+  subtitle: "Landing nhẹ hiện trước; workspace nặng (OCR, AI) chỉ dựng khi người dùng chọn tác vụ — rồi tác vụ ấy được phát lại vào workspace",
+}, (s) => {
+  const PAPER = "#F5F1E8";
+  const MUTED = "#5C665F";
+
+  // Lane centres.
+  const U = 120, P = 380, B = 660, A = 1000, M = 1400, MAIN = 1255;
+  const END = 990;      // landing lanes are destroyed here
+  const BOTTOM = 1125;
+
+  // Text with a paper patch behind it, so a lifeline running under it never
+  // cuts through the letters.
+  function tag(x, y, value, opts) {
+    opts = opts || {};
+    const size = opts.size || 16;
+    const node = s.text(x, y, value, {
+      size, anchor: opts.anchor || "middle", color: opts.color || "#17231B",
+      font: opts.font,
+    });
+    const w = node.getComputedTextLength();
+    const left = opts.anchor === "end" ? x - w : opts.anchor === "start" ? x : x - w / 2;
+    const patch = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+    for (const [k, v] of Object.entries({
+      x: left - 5, y: y - size * 0.9, width: w + 10, height: size * 1.2, rx: 5,
+      fill: PAPER, opacity: 0.94,
+    })) patch.setAttribute(k, v);
+    s.layer("text").insertBefore(patch, node);
+    return node;
+  }
+
+  // A horizontal message: numbered badge at its tail, label above the line.
+  function msg(x1, x2, y, n, label, opts) {
+    opts = opts || {};
+    const dir = Math.sign(x2 - x1);
+    s.arrow([x1, y], [x2, y], {
+      tone: opts.tone, dashed: opts.dashed, width: opts.width || 1.9, headSize: 13,
+    });
+    let start = x1;
+    if (n != null) {
+      s.badge(x1 + dir * 20, y, n, { size: 26 });
+      start = x1 + dir * 36;
+    }
+    const end = x2 - dir * 14;
+    const cx = opts.labelX != null ? opts.labelX : (start + end) / 2;
+    tag(cx, y - 8, label, {
+      size: opts.size || 16, color: opts.tone ? s.tones[opts.tone].ink : "#17231B",
+    });
+  }
+
+  // A box whose title and detail lines are centred as one block, including
+  // the room Vietnamese diacritics need above the cap height.
+  function card(x, y, w, h, o) {
+    const a = s.box(x, y, w, h, { tone: o.tone, shadow: o.shadow, radius: o.radius });
+    const L = o.labelSize || 21, S = o.subSize || 15;
+    const subs = o.sub ? String(o.sub).split("\n") : [];
+    const n = subs.length;
+    const block = 0.95 * L + (n ? 0.25 * L + 8 + 0.9 * S + (n - 1) * 1.2 * S + 0.25 * S : 0.2 * L);
+    const base = y + h / 2 - block / 2 + 0.95 * L;
+    const t = s.tones[o.tone || "paper"];
+    s.text(x + w / 2, base, o.label, { size: L, font: "title", color: t.ink, anchor: "middle" });
+    if (n) {
+      s.text(x + w / 2, base + 0.25 * L + 8 + 0.9 * S, o.sub, {
+        size: S, color: MUTED, anchor: "middle", lineHeight: 1.2 * S,
+      });
+    }
+    return a;
+  }
+
+  function lifeline(x, y1, y2) {
+    s.line([[x, y1], [x, y2]], { dashed: true, tone: "muted", width: 1.4 });
+  }
+
+  function destroyed(x, y) {
+    s.line([[x - 11, y - 11], [x + 11, y + 11]], { tone: "red", width: 2.6 });
+    s.line([[x - 11, y + 11], [x + 11, y - 11]], { tone: "red", width: 2.6 });
+  }
+
+  // ── lane heads ────────────────────────────────────────────────────────────
+  s.actor(U, 190, { label: "Người dùng", tone: "olive" });
+  card(270, 172, 220, 72, { label: "Trang landing", sub: "index.html · landing.js", tone: "olive", labelSize: 21, subSize: 15 });
+  card(525, 172, 270, 72, { label: "LandingWindow", sub: "+ LandingBridge · QWebChannel", tone: "olive", labelSize: 21, subSize: 15 });
+  card(880, 172, 240, 72, { label: "AppController", sub: "startup_controller.py", tone: "paper", labelSize: 21, subSize: 15 });
+  card(1170, 172, 170, 72, { label: "main.py", sub: "QApplication · nạp font", tone: "muted", labelSize: 21, subSize: 14 });
+
+  lifeline(U, 330, END);
+  lifeline(P, 244, END);
+  lifeline(B, 244, END);
+  lifeline(A, 244, BOTTOM);
+  lifeline(MAIN, 244, 300);
+  destroyed(P, END);
+  destroyed(B, END);
+
+  // ── 1–4: the landing comes up on a read-only snapshot ─────────────────────
+  msg(MAIN, A, 284, 1, "AppController(app).start()");
+  msg(A, B, 324, 2, "show_landing() → LandingWindow");
+  msg(B, P, 364, 3, "nạp index.html qua file://");
+  msg(P, B, 404, 4, "getSnapshot()");
+  s.arrow([B, 424], [692, 424], { tone: "blue", width: 1.7, headSize: 11 });
+  card(692, 386, 262, 108, {
+    label: "LandingSnapshotService",
+    sub: "documents.db ?mode=ro\nsố VB · số đoạn · 5 gần đây\nmodel OCR / chat: có hay thiếu",
+    tone: "blue", labelSize: 17, subSize: 14.5,
+  });
+  msg(B, P, 446, null, "JSON chỉ đọc", { dashed: true, tone: "blue" });
+
+  // ── 5–7: the user picks a task; the bridge validates it ───────────────────
+  msg(U, P, 500, 5, "chọn tác vụ / văn bản gần đây");
+  msg(P, B, 540, 6, "requestAction(action, payload)");
+  card(510, 556, 300, 72, {
+    label: "kiểm tra đầu vào",
+    sub: "ALLOWED_ACTIONS · payload là dict · docId > 0\nsai → action_rejected → thông báo",
+    tone: "red", labelSize: 18, subSize: 14, shadow: false,
+  });
+  msg(B, A, 655, 7, "action_requested(action, payload)");
+
+  // ── AppController's chain of deferred steps ───────────────────────────────
+  const BX = 885, BW = 230;
+  function step(y, h, label) {
+    s.box(BX, y, BW, h, { label, tone: "paper", labelSize: 17, shadow: false, radius: 10 });
+  }
+  function pause(y, value) {
+    tag(A, y, value, { size: 15, color: s.tones.gold.ink });
+  }
+  step(668, 36, "_on_action");
+  pause(726, "QTimer 40 ms");
+  step(736, 36, "_import_workspace");
+  s.text(1126, 759, "import main_window_1", { size: 15, color: MUTED });
+  pause(794, "QTimer 40 ms");
+  step(804, 68, "_construct_workspace");
+  pause(894, "QTimer 90 ms");
+  step(904, 36, "_present_main");
+  pause(962, "hết 260 ms");
+  step(972, 36, "_finish_transition");
+
+  // Progress milestones travel set_progress → startupProgress → the page.
+  const progress = [
+    [686, "12% Đang chuẩn bị thư viện giao diện…"],
+    [754, "38% Đã tải giao diện nghiệp vụ"],
+    [816, "65% Đang khởi tạo OCR và kho tri thức…"],
+    [860, "92% Đang hoàn thiện danh sách văn bản…"],
+    [922, "100% Sẵn sàng + startupReady"],
+  ];
+  for (const [y, label] of progress) {
+    msg(BX, P + 8, y, null, label, { tone: "olive", width: 1.5, size: 15, labelX: 522 });
+  }
+  // The page's progress overlay is up from the first milestone to startupReady.
+  s.box(P - 8, 676, 16, 256, { tone: "olive", radius: 4, shadow: false });
+  s.text(P - 18, 712, "startupProgress", { size: 14.5, color: s.tones.olive.ink, anchor: "end" });
+  s.text(P - 18, 730, "→ lớp phủ tiến độ", { size: 14.5, color: MUTED, anchor: "end" });
+
+  // ── 8–11: the workspace is built, faded in, and handed the task ───────────
+  msg(BX + BW, 1280, 838, 8, "MainWindow()");
+  card(1280, 800, 240, 76, {
+    label: "MainWindow", sub: "main_window_1.py\nDB · Chandra :9999 · ChatPanel",
+    tone: "olive", labelSize: 20, subSize: 14,
+  });
+  lifeline(M, 876, BOTTOM);
+  msg(BX + BW, M, 922, 9, "showMaximized · mờ dần 260 ms");
+  msg(BX, B, 990, 10, "close() + deleteLater()");
+  msg(BX + BW, M, 990, 11, "+80 ms · dispatch_startup_intent");
+  tag(1126, 1013, "→ add_file · add_files · add_folder · mở kho · mở chat · show_document",
+    { size: 14, color: MUTED, anchor: "start" });
+
+  // ── 12–13: home brings a fresh landing back ───────────────────────────────
+  msg(M, A, 1050, 12, "Alt+H · home_requested");
+  msg(A, 750, 1088, 13, "show_landing() · ẩn MainWindow", { size: 15 });
+  s.box(570, 1070, 180, 38, { label: "LandingWindow mới", tone: "olive", labelSize: 17, shadow: false, radius: 10 });
+  s.text(1014, 1118, "chọn lại tác vụ → _present_main ngay, không dựng lại workspace",
+    { size: 14.5, color: MUTED });
+
+  // ── notes ─────────────────────────────────────────────────────────────────
+  s.note(1150, 318, "Vì sao mở tức thì? Snapshot chỉ đọc SQLite\n(mode=ro) và xem tệp .gguf có hay không —\nchưa nạp OCR, embedding hay llama-server.", {
+    width: 392, size: 16, rotate: 1.5,
+  });
+  s.note(1150, 456, "Trang landing chỉ chạm tài nguyên cục bộ:\n• interceptor chặn mọi scheme ngoài file / qrc / data\n• CSP connect-src 'none'\n• cấm cửa sổ mới, hủy mọi tải xuống\n• dữ liệu vào DOM bằng textContent", {
+    width: 392, size: 15.5, rotate: -1.5,
+  });
+  s.note(52, 1016, "Đường lui: thiếu QWebEngine, trang không tải được hoặc tiến trình\nrender chết → LandingWindow thay bằng _NativeLanding (Qt thuần), vẫn\nđủ 5 tác vụ. Dựng workspace lỗi → startupFailed, landing vẫn mở.", {
+    width: 486, size: 15.5, rotate: -1,
+  });
+});
+</script>
+</body>
+</html>

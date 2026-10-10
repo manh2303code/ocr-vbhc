@@ -1,0 +1,24 @@
+/* Shared paper for every hand-drawn diagram. The palette is the application's
+   own (theme_tokens.COLORS), so the diagrams read as part of the same product. */
+:root {
+  --paper: #F5F1E8;
+  --ink: #17231B;
+  --muted: #5C665F;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--paper);
+}
+
+/* The board is sized exactly to the meta sketch-size so a headless screenshot
+   at that window size captures it edge to edge, with no scrollbars. */
+#board {
+  display: block;
+  overflow: hidden;
+}
+
+#board svg {
+  display: block;
+}

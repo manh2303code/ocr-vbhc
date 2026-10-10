@@ -1,0 +1,13 @@
+OCR VBHC Portable Package
+=========================
+Source checkpoint: 2026-07-11 refactor/TDD
+Python runtime:    3.9.13 embedded
+Bundled runtime:   PyTorch 2.1.2+cu118 (AI search safely uses CPU on Blackwell)
+Builder target:    PyTorch 2.8.0 CPU; optional CUDA 12.8 GPU wheel
+OCR engine:        Chandra OCR 2 Q4_K_M via llama.cpp
+Chat engine:       Qwen3 4B/8B Q4_K_M via llama.cpp (port 9998)
+
+Pipeline: PDF/image -> Chandra streaming OCR -> HTML parser -> 12 ND30 fields
+Search: local Vietnamese embedding + ViRanker + SQLite vector chunks
+
+Run verify.bat before deployment. Build output receives an exact date and Git hash.

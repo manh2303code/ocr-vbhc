@@ -1,0 +1,29 @@
+# Normalize to LF in the repository; Git restores the platform ending on checkout.
+* text=auto eol=lf
+
+# Windows launchers are executed by cmd.exe and must keep CRLF in the work tree.
+*.bat text eol=crlf
+*.wsb text eol=crlf
+
+# Qt stylesheets, SVG icons and docs are text.
+*.qss text
+*.svg text
+*.md  text
+*.txt text
+
+# Binary assets: never diff, never convert.
+*.ttf  binary
+*.otf  binary
+*.woff binary
+*.woff2 binary
+*.png  binary
+*.jpg  binary
+*.ico  binary
+*.gguf binary
+*.db   binary
+*.pdf  binary
+*.xlsx binary
+*.docx binary
+
+# Vendored, minified third-party bundle — keep out of diffs and language stats.
+frontend/landing/vendor/* linguist-vendored -diff

@@ -1,0 +1,40 @@
+<Configuration>
+  <!--
+    Windows Sandbox test config for OCR VBHC Portable.
+
+    Requires Windows 11 Pro/Enterprise/Education with Sandbox feature enabled:
+      1. Open "Turn Windows features on or off"
+      2. Check "Windows Sandbox"
+      3. Restart Windows
+      4. Double-click this .wsb file
+
+    Tests that portable package runs on a clean Windows VM
+    without ANY dependencies pre-installed (no Python, no CUDA, no Visual C++
+    redist, no nothing — just vanilla Windows 11).
+
+    VRAM not available in Sandbox → CPU-only path will be exercised.
+
+    Mounts the whole Portable folder READ-ONLY so the host copy is
+    never modified. Copies it inside the sandbox to C:\OCR_VBHC\
+    so the app can write to logs/temp/database.
+  -->
+
+  <MappedFolders>
+    <MappedFolder>
+      <HostFolder>D:\OCR_VBHC - Custom\OCR_VBHC_Portable</HostFolder>
+      <SandboxFolder>C:\OCR_Source</SandboxFolder>
+      <ReadOnly>true</ReadOnly>
+    </MappedFolder>
+  </MappedFolders>
+
+  <!-- vGPU disabled so we test the CPU-only fallback -->
+  <VGpu>Disable</VGpu>
+
+  <!-- Give it 4 CPU cores + enable network for any first-run downloads -->
+  <Networking>Enable</Networking>
+  <MemoryInMB>8192</MemoryInMB>
+
+  <LogonCommand>
+    <Command>cmd.exe /c "echo Copying portable package to writable location... && xcopy C:\OCR_Source\*.* C:\OCR_VBHC\ /s /e /i /y /q > C:\copy.log 2>&amp;1 && echo Done. && cd /d C:\OCR_VBHC && start.bat"</Command>
+  </LogonCommand>
+</Configuration>

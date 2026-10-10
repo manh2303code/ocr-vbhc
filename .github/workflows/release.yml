@@ -1,0 +1,253 @@
+name: Release
+
+# Cuts the shippable Windows package for a version tag.
+#
+# ci.yml proves the source is healthy on Linux; this is the only place an
+# artifact anyone can install is produced. It can build the runtime layer and
+# nothing else: the 16.5 GB of models, GGUF weights and llama.cpp binaries are
+# not tracked in Git, so a CI checkout has no way to include them. They travel
+# as their own bundle and BUILD_MANIFEST.json records their absence, which is
+# what lets the target machine tell a deliberate runtime-only package apart
+# from a transfer that stopped halfway.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Publish under this tag. Leave empty to rehearse without publishing."
+        type: string
+        required: false
+        default: ""
+
+concurrency:
+  group: release-${{ github.ref }}
+  # Never abort a run that may already be uploading assets: a partially
+  # published release is worse than a slow one.
+  cancel-in-progress: false
+
+permissions:
+  # gh release create writes to the repository; the default token is read-only.
+  contents: write
+
+env:
+  # GitHub's Windows runners put GITHUB_WORKSPACE on the smaller drive, which
+  # has roughly 14 GB free — not enough to hold the package and its archive at
+  # the same time. The package is therefore built off the workspace, on the
+  # roomier system drive, and the gate below measures that same drive.
+  BUILD_DRIVE: C
+  BUILD_ROOT: C:\ocr-release
+
+  # Why 16: build_portable.check_disk_space refuses to start below
+  # MIN_DISK_SPACE_GB (15) and measures the *output* drive, so any lower value
+  # here would only move the same failure a few minutes later. The extra GiB
+  # covers what pip unpacks into TEMP between this gate and that check.
+  # The real high-water mark is lower, around 12 GiB: ~8 GiB while the wheels
+  # are still unpacked next to the installed runtime, then ~6 GiB of package
+  # beside a ~3 GiB archive. The package directory is deleted before the parts
+  # are written, so splitting never raises the peak.
+  MIN_FREE_GIB: "16"
+
+jobs:
+  release:
+    name: Windows portable (runtime layer)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      # Deliberately the first step, ahead of even checkout: it reads nothing
+      # from the repository, and a runner that cannot hold the package should
+      # say so in seconds. The failure this replaces is a disk-full error about
+      # twenty minutes in, after the wheel downloads have already been paid for.
+      - name: Preflight - free disk space gate
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem |
+            Where-Object { $null -ne $_.Free } |
+            ForEach-Object {
+              "{0}: {1:N1} GiB free of {2:N1} GiB total" -f $_.Name, ($_.Free / 1GB), (($_.Used + $_.Free) / 1GB)
+            }
+
+          $required = [int]$env:MIN_FREE_GIB
+          $free = [math]::Round((Get-PSDrive -Name $env:BUILD_DRIVE).Free / 1GB, 1)
+          Write-Host "Build drive $($env:BUILD_DRIVE): $free GiB free, need $required GiB"
+
+          if ($free -lt $required) {
+            Write-Host "::error::Not enough disk on build drive $($env:BUILD_DRIVE): $free GiB free, need $required GiB. The runner image grew or the build drive changed; free space on the runner or lower MIN_FREE_GIB only if build_portable.MIN_DISK_SPACE_GB drops too."
+            exit 1
+          }
+
+      - uses: actions/checkout@v5
+
+      # The embedded runtime is downloaded by the builder; this interpreter only
+      # drives build_portable.py and release_bundle.py, both stdlib-only. Pinned
+      # to the version the application targets so the driver cannot accept
+      # syntax the shipped runtime would reject.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.9"
+
+      # A tagged push publishes. A manual run publishes only when given a tag,
+      # otherwise it rehearses the whole pipeline and publishes nothing — which
+      # is the only way to test a change to this file without burning a tag.
+      - name: Resolve release tag
+        id: release_tag
+        shell: pwsh
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $tag = $env:GITHUB_REF_NAME
+          } else {
+            $tag = $env:REQUESTED_TAG
+          }
+
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            $tag = "rehearsal-$env:GITHUB_RUN_NUMBER"
+            $publish = 'false'
+          } else {
+            $publish = 'true'
+          }
+
+          Write-Host "tag=$tag publish=$publish"
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "publish=$publish" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Build the portable package
+        shell: pwsh
+        env:
+          # checkout is shallow and fetches no tags, so git describe finds
+          # nothing and app_version would record the commit hash. A hash cannot
+          # be ordered against a release number, which would leave the updater's
+          # downgrade guard comparing hex digits. Hand it the tag we resolved.
+          OCR_APP_VERSION: ${{ steps.release_tag.outputs.tag }}
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:BUILD_ROOT | Out-Null
+          # --slim drops packages/ once the wheels are installed. Keeping them
+          # would add ~2 GB to something that still has to be archived and split
+          # on this runner, and the target machines never re-install from them.
+          python build_portable.py --profile runtime --slim --output "$env:BUILD_ROOT\OCR_VBHC_Portable"
+
+      - name: Archive the package
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ steps.release_tag.outputs.tag }}
+        run: |
+          $pkg = Join-Path $env:BUILD_ROOT 'OCR_VBHC_Portable'
+          $dist = Join-Path $env:BUILD_ROOT 'dist'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+
+          # The manifest ships inside the package and again beside the parts:
+          # an operator must be able to read which layer this is before spending
+          # an hour joining several GB to find out.
+          Copy-Item (Join-Path $pkg 'BUILD_MANIFEST.json') $dist
+
+          # bsdtar ships with Windows Server. -C keeps the package folder as the
+          # single top-level entry, so extracting cannot scatter files over the
+          # operator's working directory.
+          $archive = Join-Path $env:BUILD_ROOT "OCR_VBHC_Portable-$env:RELEASE_TAG-runtime.tar.gz"
+          tar -czf $archive -C $env:BUILD_ROOT 'OCR_VBHC_Portable'
+          if ($LASTEXITCODE -ne 0) { throw "tar failed with exit code $LASTEXITCODE" }
+
+          # Reclaim the package before the split writes a second copy of the
+          # archive; this is what keeps the peak below the gate above.
+          Remove-Item -Recurse -Force $pkg
+
+          "Archive: {0:N2} GiB" -f ((Get-Item $archive).Length / 1GB)
+          "ARCHIVE=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "DIST=$dist" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Split the archive and write checksums
+        shell: python
+        run: |
+          import os
+          import sys
+          from pathlib import Path
+
+          # `shell: python` runs a script from the runner's temp directory, so
+          # sys.path[0] is that directory rather than the checkout.
+          sys.path.insert(0, os.environ["GITHUB_WORKSPACE"])
+          import release_bundle
+
+          archive = Path(os.environ["ARCHIVE"])
+          dist = Path(os.environ["DIST"])
+
+          # GitHub rejects any single asset above 2 GiB and the runtime layer is
+          # several times that. The split has to come from release_bundle rather
+          # than from tar or 7z, because join_parts and verify_checksums on the
+          # air-gapped side only understand this layout, and they are the tools
+          # that actually ship.
+          parts = release_bundle.split_file(archive, dist)
+          archive.unlink()
+
+          # The manifest is checksummed too: it is the file that says the models
+          # are absent on purpose, so a corrupted copy is actively misleading.
+          manifest = dist / release_bundle.MANIFEST_NAME
+          checksums = release_bundle.write_checksums(
+              parts + [manifest], dist / release_bundle.CHECKSUM_NAME
+          )
+
+          # Read the checksum file back through the same function the operator
+          # will run. This costs one extra pass over the parts and proves the
+          # published SHA256SUMS is usable, not merely present.
+          problems = release_bundle.verify_checksums(checksums)
+          if problems:
+              sys.exit("Checksum verification failed:\n" + "\n".join(problems))
+
+          for path in sorted(dist.iterdir()):
+              print("{:>14,}  {}".format(path.stat().st_size, path.name))
+
+      - name: Create the GitHub release
+        if: steps.release_tag.outputs.publish == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release_tag.outputs.tag }}
+        run: |
+          # Parts without their checksums cannot be verified, and without the
+          # manifest a runtime-only package is indistinguishable from a broken
+          # transfer. All three travel together or the release is not useful.
+          $assets = @(
+            Get-ChildItem -Path (Join-Path $env:DIST '*.tar.gz.part*')
+            Get-ChildItem -Path (Join-Path $env:DIST 'SHA256SUMS')
+            Get-ChildItem -Path (Join-Path $env:DIST 'BUILD_MANIFEST.json')
+          ) | ForEach-Object { $_.FullName }
+
+          if ($assets.Count -lt 3) { throw "Expected parts, SHA256SUMS and BUILD_MANIFEST.json, found $($assets.Count) assets" }
+
+          $notes = @(
+            "Windows portable package - runtime layer only.",
+            "",
+            "Models, GGUF weights and llama.cpp binaries are not included; they are distributed as a separate asset bundle. BUILD_MANIFEST.json records exactly which components are absent and the SHA-256 of the pinned dependency set that identifies this runtime layer.",
+            "",
+            "## Restoring the package",
+            "",
+            "1. Download every .part file plus SHA256SUMS and BUILD_MANIFEST.json into one folder.",
+            "2. Verify them: sha256sum -c SHA256SUMS (or release_bundle.verify_checksums).",
+            "3. Join the parts in filename order, then extract the resulting .tar.gz.",
+            "4. Add the asset bundle, then run verify.bat inside the package.",
+            "",
+            "Built from commit $env:GITHUB_SHA."
+          ) -join [Environment]::NewLine
+
+          $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          $notes | Set-Content -Path $notesFile -Encoding utf8
+
+          gh release create $env:RELEASE_TAG $assets `
+            --title "OCR VBHC $env:RELEASE_TAG (runtime layer)" `
+            --notes-file $notesFile `
+            --verify-tag
+
+      # A rehearsal publishes nothing, so keep the two small files that prove
+      # the packaging worked. The parts themselves are several GB and are not
+      # worth storing for a dry run.
+      - name: Upload packaging metadata (rehearsal only)
+        if: steps.release_tag.outputs.publish != 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: packaging-metadata-${{ github.run_number }}
+          path: |
+            ${{ env.DIST }}/SHA256SUMS
+            ${{ env.DIST }}/BUILD_MANIFEST.json
+          retention-days: 14
+          if-no-files-found: error

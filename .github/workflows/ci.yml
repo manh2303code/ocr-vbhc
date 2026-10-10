@@ -1,0 +1,86 @@
+name: CI
+
+# The application itself is a Windows PyQt5 desktop program, so this pipeline
+# does not deploy anything. It proves the source is healthy on a clean Linux
+# machine and, on demand, emits a loadable image tarball for the air-gapped
+# network where no runner can reach a registry.
+
+on:
+  push:
+    branches: ["master", "feat/**", "fix/**", "chore/**"]
+  pull_request:
+    branches: ["master"]
+  workflow_dispatch:
+    inputs:
+      export_airgap_bundle:
+        description: "Export a docker save tarball for offline transfer"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Test suite (Linux, Python 3.9)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.ci
+          tags: ocr-vbhc-ci:${{ github.sha }}
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run test suite
+        run: |
+          docker run --rm ocr-vbhc-ci:${{ github.sha }} \
+            pytest tests/ -q --no-header -p no:cacheprovider \
+            --junit-xml=/tmp/results.xml || EXIT=$?
+          exit ${EXIT:-0}
+
+      # Tests that need GGUF weights or the embedded Windows runtime skip
+      # themselves. Anything else that skips is a signal, so surface the list.
+      - name: Report skipped tests
+        if: always()
+        run: |
+          docker run --rm ocr-vbhc-ci:${{ github.sha }} \
+            pytest tests/ -q --no-header -p no:cacheprovider -rs \
+            | sed -n '/short test summary/,$p'
+
+  airgap-bundle:
+    name: Air-gap image bundle
+    needs: tests
+    if: github.event_name == 'workflow_dispatch' && inputs.export_airgap_bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -f docker/Dockerfile.ci -t ocr-vbhc-ci:${{ github.sha }} .
+
+      # The target network cannot pull from any registry, so the image travels
+      # as a file. SHA256 lets the receiving side verify it before docker load.
+      - name: Export and checksum
+        run: |
+          mkdir -p dist
+          docker save ocr-vbhc-ci:${{ github.sha }} | gzip -9 > dist/ocr-vbhc-ci.tar.gz
+          sha256sum dist/ocr-vbhc-ci.tar.gz > dist/ocr-vbhc-ci.tar.gz.sha256
+          cat dist/ocr-vbhc-ci.tar.gz.sha256
+          ls -lh dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ocr-vbhc-ci-airgap-${{ github.sha }}
+          path: dist/
+          retention-days: 30

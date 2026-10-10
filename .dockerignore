@@ -1,0 +1,35 @@
+# The build context must stay at source size (~5 MB). Everything below is
+# either a multi-gigabyte local asset or generated state.
+
+runtime/
+packages/
+bin/
+gguf/
+model_embedding/
+model_reranker/
+tools/poppler/
+
+database/
+output/
+temp/
+backup/
+logs/
+config/
+artifacts/
+*.log
+*.db
+*.db-wal
+*.db-shm
+
+.git/
+.claude/
+
+# .github/ is deliberately NOT excluded: tests/test_release_workflow.py reads
+# release.yml as a contract, and excluding it made those tests fail inside the
+# CI container while passing on a developer machine.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+_gpu_result.txt

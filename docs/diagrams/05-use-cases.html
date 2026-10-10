@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="sketch-size" content="1600x1120">
+<title>OCR VBHC — Ca sử dụng</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Pangolin&family=Patrick+Hand&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="sketch.css">
+<script src="https://cdn.jsdelivr.net/npm/roughjs@4.6.6/bundled/rough.js" integrity="sha384-1NLkwxMO2sOqcq7rQkFBhIAUJtbt8ziLxhVKVgKfFGMEU8pF+GEq5LVogviveup6" crossorigin="anonymous"></script>
+<script src="sketch.js"></script>
+</head>
+<body>
+<div id="board"></div>
+<script>
+Sketch.draw({
+  width: 1600, height: 1120,
+  title: "Ai dùng OCR VBHC, để làm gì",
+  subtitle: "Bốn vai trò, 15 ca sử dụng — lấy từ 27 lệnh trong ui_commands.COMMANDS, các hộp thoại và script của gói portable",
+}, (s) => {
+  const MUTED = "#5C665F";
+  let seed = 501;
+  const nextSeed = () => (seed += 37);
+
+  // A UML use case: a hand-drawn ellipse with a hatched shadow, title and detail.
+  function useCase(cx, cy, label, sub, tone) {
+    const t = s.tones[tone];
+    const w = 380, h = 80;
+    const shadow = s.rc.ellipse(cx + 7, cy + 8, w, h, {
+      fill: t.stroke, fillStyle: "hachure", hachureGap: 6, hachureAngle: -40,
+      fillWeight: 0.9, stroke: "none", roughness: 1.1, seed: nextSeed(),
+    });
+    shadow.setAttribute("opacity", "0.22");
+    s.layer("shapes").appendChild(shadow);
+    s.layer("shapes").appendChild(s.rc.ellipse(cx, cy, w, h, {
+      fill: t.fill, fillStyle: "solid", stroke: t.stroke, strokeWidth: 2,
+      roughness: 1.2, bowing: 1.1, seed: nextSeed(),
+    }));
+    s.text(cx, cy - 4, label, { size: 21, font: "title", color: t.ink, anchor: "middle" });
+    s.text(cx, cy + 20, sub, { size: 15.5, color: MUTED, anchor: "middle" });
+    return { cx, cy, left: [cx - w / 2, cy], right: [cx + w / 2, cy] };
+  }
+
+  // ── system boundary: the air-gapped workstation ───────────────────────────
+  s.frame(290, 205, 1020, 800, {
+    label: "OCR VBHC — chạy offline trên máy trạm", tone: "red", washOpacity: 0.16,
+  });
+
+  const LX = 520, RX = 1080;
+  const row = (i) => 262 + i * 96;
+
+  // Văn thư: số hóa và rà soát
+  const L = [
+    useCase(LX, row(0), "Quét một văn bản", "Ctrl+O · PDF/ảnh → Chandra OCR 2", "gold"),
+    useCase(LX, row(1), "Nhập nhiều tệp / thư mục", "Ctrl+Shift+O · Ctrl+Alt+O · bỏ qua tệp đã nhập", "gold"),
+    useCase(LX, row(2), "Rà soát & sửa 12 trường", "theo NĐ 30/2020 · OCR lại khi cần", "olive"),
+    useCase(LX, row(3), "Lưu phiên bản mới", "Ctrl+S → bảng document_versions", "blue"),
+    useCase(LX, row(4), "Xuất Excel / Word", "Ctrl+E · Xuất nhanh (Word) từ kho", "blue"),
+    // Chuyên viên: tra cứu
+    useCase(LX, row(5), "Tìm theo từ khóa", "Ctrl+F · nhiều từ khóa, xếp theo tần suất", "blue"),
+    useCase(LX, row(6), "Tìm kiếm AI ngữ nghĩa", "Ctrl+Shift+F · FTS5 + vector, xếp hạng lại", "gold"),
+    useCase(LX, row(7), "Hỏi trợ lý pháp luật", "Ctrl+Shift+K · trích dẫn [n] mở đúng trang", "gold"),
+  ];
+
+  const R = [
+    useCase(RX, row(0), "Xem phân tích thống kê", "Ctrl+Shift+A · độ khẩn, theo tháng, cơ quan", "gold"),
+    useCase(RX, row(1), "Cài gói qua USB", "chép nguyên thư mục · chạy start.bat", "muted"),
+    useCase(RX, row(2), "Kiểm tra gói", "verify.bat · mã thoát 0 / 10 / 1", "muted"),
+    useCase(RX, row(3), "Áp bản vá", "CAP_NHAT.bat · kiểm SHA256SUMS, giữ bản cũ", "muted"),
+    useCase(RX, row(4), "Xây lại chỉ mục AI", "đoạn, vector, đồ thị pháp lý · dừng được", "gold"),
+    useCase(RX, row(5), "Sao lưu cơ sở dữ liệu", "SQLite backup ngay khi app đang chạy", "blue"),
+  ];
+  const related = useCase(RX, row(7), "Tra quan hệ & hiệu lực", "get_related_documents · check_validity", "gold");
+
+  // «extend»: the assistant calls these tools only when a question needs them.
+  s.arrow(related.left, L[7].right, { dashed: true, tone: "gold", width: 1.8 });
+  s.text(800, row(7) - 14, "«extend»", { size: 17, color: s.tones.gold.ink, anchor: "middle" });
+
+  // ── actors and associations ───────────────────────────────────────────────
+  function actor(x, y, label, sub, tone, cases, side) {
+    s.actor(x, y, { label, sub, tone });
+    // Start a few pixels clear of the hand so a line never reads as a long arm.
+    const hand = [x + side * 36, y + 40];
+    for (const c of cases) {
+      s.line([hand, side > 0 ? c.left : c.right], { tone, width: 1.7 });
+    }
+  }
+  actor(150, row(2) - 40, "Cán bộ văn thư", "số hóa & rà soát", "olive", L.slice(0, 5), 1);
+  actor(150, row(6) - 40, "Chuyên viên tra cứu", "tìm & hỏi đáp", "olive", L.slice(5, 8), 1);
+  actor(1450, row(0) - 40, "Lãnh đạo", "theo dõi tổng thể", "olive", R.slice(0, 1), -1);
+  actor(1450, row(3) - 40, "Quản trị kỹ thuật", "cài đặt & bảo trì", "muted", R.slice(1, 6), -1);
+
+  s.note(1335, 760, "Dữ liệu không rời máy:\nOCR, chỉ mục, hội thoại\nđều xử lý trên máy trạm,\nkhông cần Internet.", {
+    width: 222, size: 17, rotate: 2,
+  });
+
+  // ── colour key ────────────────────────────────────────────────────────────
+  const key = [
+    ["gold", "OCR & AI"], ["blue", "dữ liệu & tệp"], ["olive", "thao tác giao diện"],
+    ["muted", "công cụ đóng gói"], ["red", "ranh giới offline"],
+  ];
+  let kx = 70;
+  s.text(kx, 1046, "Màu:", { size: 17, color: MUTED });
+  kx += 46;
+  for (const [tone, name] of key) {
+    const t = s.tones[tone];
+    s.layer("shapes").appendChild(s.rc.circle(kx + 9, 1040, 18, {
+      fill: t.fill, fillStyle: "solid", stroke: t.stroke, strokeWidth: 1.6, roughness: 1, seed: nextSeed(),
+    }));
+    const node = s.text(kx + 24, 1046, name, { size: 17, color: MUTED });
+    kx += 24 + node.getComputedTextLength() + 26;
+  }
+});
+</script>
+</body>
+</html>
