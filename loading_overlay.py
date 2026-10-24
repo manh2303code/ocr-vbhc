@@ -9,6 +9,11 @@ A progress bar jumping between known stages (15/35/65/90/100%) is honest UX:
 user reads "Đang tải mô hình AI..." and the bar holding at 65% during the
 block reads as "I know what stage we're at" not "the app froze".
 
+2026-10 redesign: the home page's startup line (frontend/landing: a message,
+a 2px line in the olive, the percent underneath) on a floating surface with
+a border_strong hairline, in both themes. Colours come from the stylesheet
+("AREA: dialogs" in devtools/theme_template.qss).
+
 Usage:
     overlay = LoadingOverlay(parent=intro_page._container)
     overlay.center_in(intro_page._container)
@@ -16,14 +21,13 @@ Usage:
     overlay.set_progress(35, "Đang khởi động OCR engine...")
 """
 from PyQt5.QtCore import Qt, QPropertyAnimation, QEasingCurve
-from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QProgressBar, QGraphicsOpacityEffect
 )
 
 
 class LoadingOverlay(QWidget):
-    """Centered loading panel: title + status text + progress bar.
+    """Centered loading panel: title + status text + progress line + percent.
 
     Fixed size so layout stays stable across stage transitions. Uses
     QGraphicsOpacityEffect for container fade (setWindowOpacity is
@@ -31,69 +35,48 @@ class LoadingOverlay(QWidget):
     """
 
     WIDTH = 360
-    HEIGHT = 140
+    HEIGHT = 120
 
-    def __init__(self, accent_color="#00fbfb", parent=None):
+    def __init__(self, accent_color=None, parent=None):
+        """accent_color: an optional colour for the progress line; by default
+        it is the olive of the theme, like the home page's startup line."""
         super().__init__(parent)
+        self.setObjectName("loadingOverlay")
         self.setFixedSize(self.WIDTH, self.HEIGHT)
-        self.setAttribute(Qt.WA_TranslucentBackground)
-
-        # Translucent dark panel matching intro's aesthetic.
-        self.setStyleSheet(f"""
-            LoadingOverlay {{
-                background: rgba(12, 19, 36, 0.92);
-                border: 1px solid rgba(0, 251, 251, 0.28);
-                border-radius: 14px;
-            }}
-            QLabel {{ background: transparent; }}
-            QProgressBar {{
-                background: rgba(255, 255, 255, 0.08);
-                border: none;
-                border-radius: 3px;
-                height: 6px;
-                max-height: 6px;
-            }}
-            QProgressBar::chunk {{
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                                            stop:0 {accent_color},
-                                            stop:1 #00dddd);
-                border-radius: 3px;
-            }}
-        """)
+        self.setAttribute(Qt.WA_StyledBackground, True)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(22, 20, 22, 20)
+        layout.setContentsMargins(20, 16, 20, 14)
         layout.setSpacing(0)
 
         # Title — stage group header.
         self._title = QLabel("Đang khởi động")
-        self._title.setFont(QFont("Be Vietnam Pro", 12, QFont.Bold))
-        self._title.setStyleSheet("color: #ffffff; letter-spacing: 0.02em;")
+        self._title.setObjectName("loadingTitle")
         layout.addWidget(self._title)
-        layout.addSpacing(6)
+        layout.addSpacing(2)
 
         # Status — detailed stage description, updated per step.
         self._status = QLabel("Chuẩn bị môi trường...")
-        self._status.setFont(QFont("Be Vietnam Pro", 10))
-        self._status.setStyleSheet("color: #b9cac9;")
+        self._status.setObjectName("loadingStatus")
         self._status.setWordWrap(True)
         layout.addWidget(self._status)
         layout.addStretch()
 
-        # Progress bar — determinate, advances via QPropertyAnimation at 300ms.
+        # Progress line — determinate, advances via QPropertyAnimation.
         self._progress = QProgressBar()
+        self._progress.setObjectName("loadingBar")
         self._progress.setRange(0, 100)
         self._progress.setValue(0)
         self._progress.setTextVisible(False)
-        self._progress.setFixedHeight(6)
+        if accent_color:
+            self._progress.setStyleSheet(
+                "QProgressBar::chunk {{ background: {}; }}".format(accent_color))
         layout.addWidget(self._progress)
 
-        # Percent label (right-aligned below bar)
-        layout.addSpacing(4)
+        # The percent under the line, at its start (as on the home page).
+        layout.addSpacing(6)
         self._pct = QLabel("0%")
-        self._pct.setFont(QFont("Be Vietnam Pro", 9))
-        self._pct.setStyleSheet("color: #839493;")
-        self._pct.setAlignment(Qt.AlignRight)
+        self._pct.setObjectName("loadingPercent")
         layout.addWidget(self._pct)
 
         # Opacity effect for container fade (child widgets can't setWindowOpacity).

@@ -6,7 +6,7 @@ title OCR VBHC - Khoi dong
 
 echo.
 echo  ================================================================
-echo    OCR VBHC Portable  -  Cuc TTKTP va NV
+echo    OCR VBHC Portable
 echo  ================================================================
 echo.
 

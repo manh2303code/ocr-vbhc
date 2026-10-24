@@ -79,6 +79,7 @@ CORE_PY_FILES = [
     "chandra_field_parser.py",
     "html_to_docx.py",
     "display_html_renderer.py",
+    "editor_widgets.py",        # document editor: growing fields, date popover
     "pdf_rendering.py",
     "pdf_load_worker.py",       # Phase L: async PDF loader (avoids UI freeze)
     "hardware_detect.py",
@@ -122,9 +123,13 @@ CORE_PY_FILES = [
     "chat_server_manager.py",
     "llm_client.py",
     "agent_tools.py",
+    "doc_resolver.py",          # documents a chat question names or points at
+    "metadata_query.py",        # chat questions answered from a table of the metadata
+    "answer_check.py",          # chat answers checked against their sources
     "rag_agent.py",
     "chat_history.py",
     "chat_panel.py",
+    "chat_widgets.py",          # native chat transcript, composer, live answer
     "reindex_dialog.py",
     "reranker.py",
     "analytics_dialog.py",
@@ -138,7 +143,7 @@ STATIC_FILES = [
     "theme.qss",                # Phase L: main window light theme
     "theme_dark.qss",           # dark theme selected by persisted settings
     "PORTABLE_README.md",       # offline usage, corpus import and chat guide
-    "THIRD_PARTY_NOTICES.md",   # GSAP/font/icon licenses
+    "THIRD_PARTY_NOTICES.md",   # font/icon licenses
     RUNTIME_LOCK_FILE,          # runtime layer identity, read by the updater
     "CAP_NHAT.bat",             # operator entry point for applying a patch
 ]

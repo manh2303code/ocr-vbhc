@@ -1,11 +1,11 @@
 """
 Design tokens — single source of truth for colors/spacing/typography.
 
-Light theme: olive, gold and red accents on a warm-cream document-paper
-background.
-
-Intro page keeps its existing dark theme; these tokens apply only to
-MainWindow + its dialogs via `setStyleSheet` scoped to MainWindow root.
+Olive, gold and red accents on neutral
+document paper, in a light and a dark palette with the same token names.
+theme.qss and theme_dark.qss are generated from devtools/theme_template.qss
+with these values (devtools/build_qss.py); the landing page and the chat
+dock read them too.
 
 Usage:
     from theme_tokens import COLORS, FONT, qss_content
@@ -15,53 +15,55 @@ from pathlib import Path
 
 
 # ── Palette ────────────────────────────────────────────────────
+# Olive, gold and red accents on neutral
+# document paper. 2026-10 redesign: the warm cream page (#F5F1E8) was the
+# most generic-looking choice in the app and is gone; olive carries actions
+# and selection, gold is a small mark (document number, focus), never a fill
+# for large areas.
 COLORS = {
-    # Surfaces — warm administrative paper
-    'bg':              '#F5F1E8',   # page background (warm paper)
-    'surface':         '#FFFEFA',   # card / input surface
-    'surface_alt':     '#EFEADF',   # alternating row, muted panel
-    'surface_hover':   '#EAE4D7',   # hover state
-    'surface_pressed': '#E0D8C9',   # active/pressed
+    # Surfaces — neutral printing paper, a faint green-grey cast
+    'bg':              '#EEF0EE',   # window canvas
+    'surface':         '#FFFFFF',   # panels, inputs, document
+    'surface_alt':     '#F6F7F6',   # alternating row, quiet panel
+    'surface_hover':   '#E8EBE8',
+    'surface_pressed': '#DCE1DC',
 
-    # Primary — olive green
-    'primary':         '#24432D',
-    'primary_hover':   '#315A3E',
-    'primary_muted':   '#52745D',
-    'primary_soft':    '#E2EAE4',   # bg tint (selected row)
+    # Primary — olive, deepened for white text
+    'primary':         '#2B4A33',
+    'primary_hover':   '#36593F',
+    'primary_muted':   '#3D6648',
+    'primary_soft':    '#E3EBE5',   # selected row, checked tool button
 
-    # Accent — emblem gold
-    # Darkened from #8E6B16: that reached AA on `surface` but only 4.37 on the
-    # page background and 4.10 on alternating rows.
-    'accent_gold':      '#846314',
-    'accent_gold_hover':'#755811',
-    'accent_gold_soft': '#F2E8C8',
+    # Accent — emblem gold, darkened to read on every light surface
+    'accent_gold':      '#7A5D0F',
+    'accent_gold_hover':'#664E0C',
+    'accent_gold_soft': '#F4EBCF',
 
     # CTA — flag red (urgent actions, dangerous ops)
     'cta':       '#B3263E',
     'cta_hover': '#931E33',
 
-    # Text
-    'text':            '#17231B',
-    'text_secondary':  '#5C665F',
-    # Darkened from #667085 for the same reason: 4.41 on bg, 4.15 on rows.
-    'text_muted':      '#5F687C',
-    'text_on_primary': '#FFFEFA',
+    # Text — olive-tinted ink
+    'text':            '#18211B',
+    'text_secondary':  '#48524B',
+    'text_muted':      '#5D6760',
+    'text_on_primary': '#FFFFFF',
 
     # Borders
-    'border':        '#D8D1C3',
-    'border_strong': '#C6BBA8',
-    'border_focus':  '#846314',   # tracks accent_gold; a test fails if they drift
+    'border':        '#D5DAD5',
+    'border_strong': '#B7BFB8',
+    'border_focus':  '#7A5D0F',   # tracks accent_gold; a test fails if they drift
 
     # Status
-    'success': '#1E7A2B',
-    'warning': '#D97706',
-    'danger':  '#C41E3A',
-    'info':    '#235FE1',   # darkened: 4.31 on alternating rows was below AA
+    'success': '#1F7A3D',
+    'warning': '#D97706',   # a fill under dark text, never text itself
+    'danger':  '#B3263E',
+    'info':    '#2F5E9E',
 
-    # NĐ30 urgency — strong contrast on cream bg
+    # NĐ30 urgency
     'urgency_hoa_toc':     '#DC2626',
     'urgency_thuong_khan': '#EA580C',
-    'urgency_khan':        '#D4AF37',
+    'urgency_khan':        '#B58A12',
 
     # NĐ30 classification
     'classif_mat':       '#DB2777',
@@ -101,44 +103,44 @@ FONT = {
 # text — which is what the landing page needed, since it styles .brand and the
 # about headings with the olive and was rendering them at 2.39 in dark mode.
 DARK_COLORS = {
-    # Surfaces — deep slate, warm paper inverted
-    'bg':              '#0F1419',
-    'surface':         '#1A2332',
-    'surface_alt':     '#1E2B3D',
-    'surface_hover':   '#253349',
-    'surface_pressed': '#2D3B52',
+    # Surfaces — the same paper, inverted: near-black with the olive cast
+    'bg':              '#121513',
+    'surface':         '#191D1A',
+    'surface_alt':     '#1F2420',
+    'surface_hover':   '#262C27',
+    'surface_pressed': '#2F3630',
 
     # Primary — olive, fill only; see the note above
-    'primary':         '#4A6B52',
-    'primary_hover':   '#557A5E',
-    'primary_muted':   '#7FA187',   # the brand colour when it has to be text
-    'primary_soft':    '#243B31',
+    'primary':         '#3F6A4B',
+    'primary_hover':   '#4A7857',
+    'primary_muted':   '#8CB497',   # the brand colour when it has to be text
+    'primary_soft':    '#1F2B22',
 
-    'accent_gold':      '#E5C466',
-    'accent_gold_hover': '#D4B255',
-    'accent_gold_soft': '#3A3218',
+    'accent_gold':      '#E2C46A',
+    'accent_gold_hover': '#D3B356',
+    'accent_gold_soft': '#352E17',
 
-    'cta':       '#F87171',
-    'cta_hover': '#EF5A5A',
+    'cta':       '#F28B8B',
+    'cta_hover': '#EC7474',
 
-    'text':            '#E8EBF5',
-    'text_secondary':  '#A8B2D1',
-    'text_muted':      '#8C97B5',
-    'text_on_primary': '#FFFEFA',
+    'text':            '#E6E9E6',
+    'text_secondary':  '#B2BAB3',
+    'text_muted':      '#929B94',
+    'text_on_primary': '#FFFFFF',
 
-    'border':        '#2D3B52',
-    'border_strong': '#3A4A64',
-    'border_focus':  '#E5C466',   # tracks accent_gold
+    'border':        '#2B312C',
+    'border_strong': '#3F4741',
+    'border_focus':  '#E2C46A',   # tracks accent_gold
 
     # Status — lightened so they read on dark; dark text goes on top of them
-    'success': '#7BD88F',
-    'warning': '#F5B841',
-    'danger':  '#F87171',
-    'info':    '#7FB2FF',
+    'success': '#6FC48E',
+    'warning': '#E3A857',
+    'danger':  '#F28B8B',
+    'info':    '#8DB0E6',
 
     'urgency_hoa_toc':     '#FF6B6B',
     'urgency_thuong_khan': '#FF9F5A',
-    'urgency_khan':        '#E5C466',
+    'urgency_khan':        '#E2C46A',
 
     'classif_mat':       '#F472B6',
     'classif_toi_mat':   '#C084FC',

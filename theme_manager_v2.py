@@ -26,6 +26,7 @@ API:
 """
 from __future__ import annotations
 
+import gc
 import logging
 from pathlib import Path
 from typing import Optional
@@ -60,7 +61,7 @@ def _palette_from(tokens):
         "button_text":    tokens["primary"],
         "highlight":      tokens["primary"],
         "highlight_text": tokens["text_on_primary"],
-        "tooltip_base":   tokens["accent_gold_soft"],
+        "tooltip_base":   tokens["surface"],
         "tooltip_text":   tokens["text"],
         "link":           tokens["accent_gold"],
     }
@@ -126,13 +127,24 @@ class ThemeManager(QObject):
         # 1. Load QSS
         qss_path = DARK_QSS_PATH if name == "dark" else LIGHT_QSS_PATH
         try:
-            qss_text = qss_path.read_text(encoding="utf-8")
+            # url() in the stylesheet is relative to the app folder; Qt
+            # resolves relative urls against the working directory instead.
+            qss_text = qss_path.read_text(encoding="utf-8").replace("@APP_DIR@", _DIR.as_posix())
         except Exception as e:
             logger.error(f"Failed to read {qss_path}: {e}")
             qss_text = ""
 
-        # 2. App stylesheet
-        app.setStyleSheet(qss_text)
+        # 2. App stylesheet. setStyleSheet repolishes every widget; if
+        # Python's garbage collector runs in the middle of that and deletes
+        # a leftover wrapper, Qt destroys a widget it is still walking and
+        # crashes (seen in the test suite). Collect afterwards instead.
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            app.setStyleSheet(qss_text)
+        finally:
+            if gc_was_enabled:
+                gc.enable()
 
         # 3. QPalette
         self._apply_palette(app, name)
@@ -198,46 +210,91 @@ class ThemeManager(QObject):
         app.setPalette(pal)
 
     def _apply_matplotlib(self, name: str) -> None:
-        """Configure matplotlib global rcParams for current theme.
+        """Point matplotlib's global rcParams at the theme (matplotlib_rc).
 
-        Charts created AFTER this call will use the new theme. Existing
-        figures need redraw to pick up changes.
+        Charts created after this call take the theme; drawn figures need a
+        redraw. Only when matplotlib is already loaded: importing pyplot here
+        cost every start about 300 ms although only the analytics dialog
+        draws charts, and that dialog draws inside matplotlib_rc itself.
+        rcParams are updated, not reset to a style first, so a font the
+        chart code registered survives a theme switch.
         """
+        import sys
+
+        mpl = sys.modules.get("matplotlib")
+        if mpl is None:
+            return
         try:
-            import matplotlib
-            import matplotlib.pyplot as plt
-            if name == "dark":
-                plt.style.use("dark_background")
-                matplotlib.rcParams.update({
-                    "axes.facecolor": "#1A2332",
-                    "figure.facecolor": "#0F1419",
-                    "axes.edgecolor": "#2D3B52",
-                    "axes.labelcolor": "#E8EBF5",
-                    "xtick.color": "#A8B2D1",
-                    "ytick.color": "#A8B2D1",
-                    "grid.color": "#2D3B52",
-                    "text.color": "#E8EBF5",
-                    "axes.titlecolor": "#E8EBF5",
-                    "savefig.facecolor": "#0F1419",
-                })
-            else:
-                plt.style.use("default")
-                matplotlib.rcParams.update({
-                    "axes.facecolor": "#FFFFFF",
-                    "figure.facecolor": "#FAFAF5",
-                    "axes.edgecolor": "#E5E4DE",
-                    "axes.labelcolor": "#1E3924",
-                    "xtick.color": "#4B5563",
-                    "ytick.color": "#4B5563",
-                    "grid.color": "#E5E4DE",
-                    "text.color": "#1E3924",
-                    "axes.titlecolor": "#1E3924",
-                    "savefig.facecolor": "#FAFAF5",
-                })
-        except ImportError:
-            pass
+            mpl.rcParams.update(matplotlib_rc(name))
         except Exception as e:
             logger.debug(f"matplotlib theme apply failed: {e}")
+
+
+# Chart colours, in the order a chart takes them: olive carries the data,
+# gold is the second colour only (a mark, never the main series), then the
+# quiet greys. primary_muted is the olive that reads on the surface of both
+# themes (primary itself is a dark fill in the dark theme).
+CHART_SERIES_TOKENS = ("primary_muted", "accent_gold", "text_muted", "border_strong")
+
+
+def matplotlib_rc(theme: str) -> dict:
+    """rcParams for flat, quiet charts in `theme`; every colour a theme token.
+
+    The figure lies on the panel surface. Axes are hairlines in the border
+    colour, left and bottom only; no grid unless a chart turns one on (then
+    a solid hairline); ticks without marks; titles in sentence case at the
+    left, in the text colour. Text uses the text tokens, never a series
+    colour.
+    """
+    from cycler import cycler
+
+    tokens = theme_tokens.colors_for(theme)
+    series = [tokens[key] for key in CHART_SERIES_TOKENS]
+    return {
+        "figure.facecolor": tokens["surface"],
+        "figure.edgecolor": tokens["surface"],
+        "savefig.facecolor": tokens["surface"],
+        "savefig.edgecolor": tokens["surface"],
+        "axes.facecolor": tokens["surface"],
+        "axes.edgecolor": tokens["border"],
+        "axes.linewidth": 0.8,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.grid": False,
+        "axes.axisbelow": True,
+        "axes.labelcolor": tokens["text_secondary"],
+        "axes.titlecolor": tokens["text"],
+        "axes.titlesize": 10,
+        "axes.titleweight": "semibold",
+        "axes.titlelocation": "left",
+        "axes.titlepad": 10,
+        "axes.prop_cycle": cycler(color=series),
+        "axes.unicode_minus": False,
+        "grid.color": tokens["border"],
+        "grid.linestyle": "-",
+        "grid.linewidth": 0.8,
+        "text.color": tokens["text"],
+        "xtick.color": tokens["border"],
+        "ytick.color": tokens["border"],
+        "xtick.labelcolor": tokens["text_secondary"],
+        "ytick.labelcolor": tokens["text_secondary"],
+        "xtick.labelsize": 8.5,
+        "ytick.labelsize": 8.5,
+        "xtick.major.size": 0,
+        "ytick.major.size": 0,
+        "xtick.minor.size": 0,
+        "ytick.minor.size": 0,
+        "xtick.major.pad": 6,
+        "ytick.major.pad": 6,
+        "legend.frameon": False,
+        "legend.labelcolor": tokens["text_secondary"],
+        "lines.color": series[0],
+        "lines.linewidth": 2,
+        "patch.facecolor": series[0],
+        "patch.edgecolor": tokens["surface"],
+        "patch.linewidth": 0,
+        "font.size": 9,
+    }
 
 
 def get_theme_color(key: str) -> str:

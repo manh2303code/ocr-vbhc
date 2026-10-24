@@ -18,6 +18,12 @@ os.environ.setdefault('TRANSFORMERS_OFFLINE', '1')
 logger = logging.getLogger("Reranker")
 
 RERANKER_MODEL_DIR = Path(__file__).parent / "model_reranker"
+# Tokens of (question, passage) the cross-encoder reads. A 480-character
+# window (retrieval.RERANK_PASSAGE_CHARS) plus the question is at most 233.
+# Measured on the 41-question set (research/token-limits_results.md): 512
+# tokens with 1600- or 1200-character windows saw no more answers (35/39
+# against 36/39 shown to the model) and took 1.4-2x the CPU prefetch time.
+RERANK_MAX_TOKENS = 256
 
 
 class RerankerModel:
@@ -84,11 +90,17 @@ class RerankerModel:
                 f"(of {cpu_count} cores — leaving rest for llama-server)"
             )
 
+            # CPU only. The model loads at startup, before Chandra and the
+            # chat server take the GPU; on the cards the app's torch supports
+            # (RTX 20/30) its fp32 weights would hold about 2.6 GB of VRAM
+            # that llama-server needs, and the speed-up (0.62 s against 9.8 s
+            # for 20 pairs) was measured only in a newer torch outside the
+            # app (research/token-limits_results.md).
             logger.info("Loading reranker (CrossEncoder) from %s...", self.model_dir)
             self.model = CrossEncoder(
                 str(self.model_dir),
                 device="cpu",
-                max_length=256,
+                max_length=RERANK_MAX_TOKENS,
             )
             self.tokenizer = None
 
@@ -139,16 +151,29 @@ class RerankerModel:
 
             # CrossEncoder.predict handles batching + no_grad internally — fast
             raw_scores = self.model.predict(pairs, show_progress_bar=False)
-            raw_scores = np.asarray(raw_scores).reshape(-1)
+            raw_scores = np.asarray(raw_scores, dtype=np.float64).reshape(-1)
 
-            # Normalize each logit independently. Per-result min-max made the
-            # first item 100% and the last 0% regardless of absolute relevance.
+            # Each score on its own, never min-max over the results: that made
+            # the first item 100% and the last 0% regardless of relevance.
+            # A one-label CrossEncoder already applies a sigmoid in predict();
+            # a second one squeezed every score into [0.5, 0.731].
+            if self._predicts_probabilities():
+                return np.clip(raw_scores, 0.0, 1.0).tolist()
             clipped = np.clip(raw_scores, -60.0, 60.0)
             return (1.0 / (1.0 + np.exp(-clipped))).tolist()
 
         except Exception as e:
             logger.error("Reranking error: %s", e)
             return [0.5] * len(texts)
+
+    def _predicts_probabilities(self) -> bool:
+        """True when the model's predict() ends in a sigmoid (sentence-
+        transformers does so for a one-label cross-encoder such as ViRanker);
+        otherwise it returns logits and rerank applies the sigmoid itself."""
+        activation = getattr(self.model, "activation_fn", None)
+        if activation is None:  # sentence-transformers < 4
+            activation = getattr(self.model, "default_activation_function", None)
+        return type(activation).__name__ == "Sigmoid"
 
     def unload(self):
         """Release model from memory."""

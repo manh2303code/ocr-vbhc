@@ -9,6 +9,7 @@ from app_config import (
     CHAT_MODELS,
     CHAT_PORT,
     LLAMA_SERVER_HOST,
+    chat_context_size,
     get_chat_model_path,
     get_llama_bin_dir,
     get_llama_server_exe,
@@ -23,7 +24,14 @@ logger = logging.getLogger("ChatServer")
 def build_chat_server_command(server_exe: Path, model_path: Path, port: int,
                               backend: str, ctx: int,
                               threads: int) -> List[str]:
-    """Build the side-effect-free llama-server command for legal chat."""
+    """Build the side-effect-free llama-server command for legal chat.
+
+    One slot (-np 1): there is one user, so the whole context belongs to one
+    conversation instead of four slots sharing it (the default), and the
+    agent's token budget is exact. The RAM prompt cache is capped at 1 GiB;
+    its 8 GiB default grew by about 290 MiB per question. The slot keeps its
+    own prompt prefix for reuse either way.
+    """
     return [
         str(server_exe), "-m", str(model_path),
         "--port", str(port), "--host", LLAMA_SERVER_HOST,
@@ -32,6 +40,7 @@ def build_chat_server_command(server_exe: Path, model_path: Path, port: int,
         "--cache-type-k", "q8_0", "--cache-type-v", "q8_0",
         "--flash-attn", "auto",
         "--chat-template-kwargs", '{"enable_thinking": false}',
+        "-np", "1", "--cache-ram", "1024",
         "-ngl", "99" if backend == "cuda" else "0",
     ]
 
@@ -42,10 +51,16 @@ class ChatServerManager(LlamaServerManager):
     def __init__(self, port: int = CHAT_PORT):
         super().__init__(port=port)
         self._active_model_key: Optional[str] = None
+        self._active_context_size: Optional[int] = None
 
     @property
     def active_model_key(self) -> Optional[str]:
         return self._active_model_key
+
+    @property
+    def active_context_size(self) -> Optional[int]:
+        """Context tokens the running chat server was started with."""
+        return self._active_context_size
 
     def start_chat(self, timeout: float = 120.0,
                    model_key: Optional[str] = None,
@@ -82,7 +97,7 @@ class ChatServerManager(LlamaServerManager):
                 "llama-server binary directory not found for '{}'".format(backend)
             )
 
-        ctx = profile["ctx_gpu" if use_cuda else "ctx_cpu"]
+        ctx = chat_context_size(model_key, backend)
         threads = min(8, os.cpu_count() or 4)
         command = build_chat_server_command(
             server_exe, model_path, self._port, backend, ctx, threads
@@ -120,5 +135,6 @@ class ChatServerManager(LlamaServerManager):
                 "Chat llama-server not healthy after {}s".format(timeout)
             )
         self._active_model_key = model_key
+        self._active_context_size = ctx
         logger.info("Chat llama-server ready at %s (PID: %s)",
                     self._url, self._process.pid)

@@ -108,6 +108,14 @@ class PortableManifestTests(unittest.TestCase):
         self.assertIn("import sqlite_vec", verify)
         self.assertIn("import sqlite_vec", inspect.getsource(build_portable.step4_install_packages))
 
+    def test_reocr_tool_ships_and_is_verified(self):
+        # Repairs documents OCR'd before the page quality gate on site, with
+        # the package's own runtime; tools/ is copied as a resource dir.
+        self.assertTrue((ROOT / "tools" / "reocr_documents.py").is_file())
+        self.assertIn("tools", build_portable.RESOURCE_DIRS)
+        verify = (ROOT / "verify.bat").read_text(encoding="utf-8-sig")
+        self.assertIn("tools\\reocr_documents.py", verify)
+
     def test_webengine_and_local_fonts_are_bundled_and_verified(self):
         requirements = (ROOT / "requirements_portable.txt").read_text(encoding="utf-8")
         verify = (ROOT / "verify.bat").read_text(encoding="utf-8-sig")

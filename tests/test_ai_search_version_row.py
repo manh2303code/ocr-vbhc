@@ -68,5 +68,38 @@ class VersionRowIndexingTests(unittest.TestCase):
         self.assertIsNone(store.chunks[0][2])
 
 
+class EmbeddingLengthTests(unittest.TestCase):
+    def test_embedding_reads_at_most_the_2048_tokens_it_was_trained_on(self):
+        # model_embedding/README.md: trained with max sequence length 2048.
+        # Chunks are about 470 tokens (max 816), so nothing is cut today.
+        import sys
+        import types
+        from unittest.mock import patch
+
+        import ai_search
+
+        class _SentenceTransformer:
+            def __init__(self, *_args, **_kwargs):
+                self.max_seq_length = 8192
+
+        fake = types.ModuleType("sentence_transformers")
+        fake.SentenceTransformer = _SentenceTransformer
+        saved = sys.modules.get("sentence_transformers")
+        sys.modules["sentence_transformers"] = fake
+        try:
+            with patch.object(ai_search.EmbeddingModel, "is_available", return_value=True), \
+                    patch.object(ai_search, "preferred_torch_device", return_value="cpu"):
+                model = ai_search.EmbeddingModel()
+                self.assertTrue(model.load())
+        finally:
+            if saved is None:
+                sys.modules.pop("sentence_transformers", None)
+            else:
+                sys.modules["sentence_transformers"] = saved
+
+        self.assertEqual(ai_search.EMBEDDING_MAX_TOKENS, 2048)
+        self.assertEqual(model.model.max_seq_length, 2048)
+
+
 if __name__ == "__main__":
     unittest.main()

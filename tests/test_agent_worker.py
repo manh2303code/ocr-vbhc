@@ -97,6 +97,63 @@ class AgentWorkerTests(unittest.TestCase):
         self.assertEqual(["Trả"], old_tokens)
         self.assertEqual(original, (agent.step_cb, agent.token_cb, agent.cancel_check))
 
+    def test_cancel_during_stream_abandons_generation_at_the_next_token(self):
+        """Stop used to wait for the whole answer to finish streaming: the
+        agent only looked at cancel_check between model calls."""
+
+        class StreamingAgent(_FakeAgent):
+            def __init__(self):
+                super().__init__()
+                self.sent = 0
+
+            def ask(self, question, history=None):
+                for _ in range(200):
+                    self.sent += 1
+                    self.token_cb("tok ")
+                return AgentResult("đủ", [], [])
+
+        agent = StreamingAgent()
+        worker = AgentWorker(agent, "Câu hỏi")
+        results, errors, shown = [], [], []
+        worker.finished_result.connect(results.append)
+        worker.error.connect(errors.append)
+        worker.token.connect(shown.append)
+        worker.token.connect(
+            lambda _token: worker.cancel() if agent.sent == 3 else None
+        )
+
+        worker.run()
+
+        # The token after the click is neither shown nor waited for.
+        self.assertEqual(3, len(shown))
+        self.assertEqual(4, agent.sent)
+        self.assertEqual([], errors)
+        self.assertEqual("cancelled", results[0].error)
+        self.assertIsNone(agent.token_cb)
+
+    def test_sources_are_bridged_to_a_signal_and_the_callback_restored(self):
+        class SourceAgent(_FakeAgent):
+            def __init__(self):
+                super().__init__()
+                self.sources_cb = None
+
+            def ask(self, question, history=None):
+                self.sources_cb(["nguồn 1"])
+                return self.result
+
+        agent = SourceAgent()
+        earlier = []
+        agent.sources_cb = earlier.append
+        worker = AgentWorker(agent, "Câu hỏi")
+        seen = []
+        worker.sources.connect(seen.append)
+
+        worker.run()
+
+        self.assertEqual([["nguồn 1"]], seen)
+        self.assertEqual([["nguồn 1"]], earlier)
+        self.assertEqual(earlier.append, agent.sources_cb)
+
     def test_exception_emits_error_without_finished_result(self):
         worker = AgentWorker(_FakeAgent(exc=RuntimeError("server unavailable")), "bí mật")
         errors, results = [], []

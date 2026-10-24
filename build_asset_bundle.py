@@ -138,14 +138,29 @@ def parse_checksums(text: str) -> dict:
     return digests
 
 
-def unsafe_members(names):
-    """Return archive members that would write outside the destination.
+def unsafe_members(members):
+    """Return the names of archive members that could write outside the destination.
 
-    The archive arrives on removable media, so its member names are input, not
+    The archive arrives on removable media, so its members are input, not
     something to trust. Python 3.9 has no extraction filter (added in 3.12).
+    `members` may be plain names or tarfile.TarInfo objects; only the latter
+    can be checked for type, which is what restore_assets passes.
+
+    A link is refused even when its own name is harmless: extracting it makes
+    a later member of the same name, or under it, write wherever the link
+    points. create_archive dereferences links, so a genuine bundle never
+    holds one — nor a device file or FIFO, which are refused for the same
+    reason a link is: they are not weights or binaries.
     """
     rejected = []
-    for name in names:
+    for member in members:
+        if isinstance(member, tarfile.TarInfo):
+            name = member.name
+            if not (member.isreg() or member.isdir()):
+                rejected.append(name)
+                continue
+        else:
+            name = member
         text = str(name).replace("\\", "/")
         # An absolute path, or a Windows drive letter, escapes on its own.
         if text.startswith("/") or ":" in text.split("/")[0]:
@@ -160,6 +175,37 @@ def unsafe_members(names):
                 rejected.append(name)
                 break
     return rejected
+
+
+def is_plain_file_name(name) -> bool:
+    """Whether `name` names a file directly inside whatever directory it is joined to.
+
+    The archive and part names in ASSET_MANIFEST.json are joined onto the
+    bundle and staging directories, and the manifest travels on the same USB
+    stick as the parts, so a name is input just as a member name is. pack only
+    ever writes names like `assets.tar.part001`; anything with a separator, a
+    drive or a `..` was not written by pack.
+    """
+    if not isinstance(name, str) or not name:
+        return False
+    if any(mark in name for mark in ("/", "\\", ":", "\0")) or ".." in name:
+        return False
+    return Path(name).name == name
+
+
+def manifest_name_problems(manifest):
+    """Return a problem for each manifest file name that is not a plain file name."""
+    archive_name = manifest.get("archive", {}).get("name", ARCHIVE_STEM + ".tar")
+    labelled = [("archive", archive_name)] + [
+        ("part {}".format(index), part.get("name"))
+        for index, part in enumerate(manifest.get("parts", []), start=1)
+    ]
+    return [
+        "{}: {} name {!r} is not a plain file name; refusing to read or write "
+        "outside the bundle".format(ASSET_MANIFEST_NAME, label, name)
+        for label, name in labelled
+        if not is_plain_file_name(name)
+    ]
 
 
 def build_asset_manifest(summaries, parts, archive, built_at,
@@ -395,8 +441,11 @@ def create_archive(source_root, names, archive_path, compression="none") -> Path
 
     _, mode = _ARCHIVE_MODES[compression]
     # PAX, because ustar caps a member at 8 GiB and single GGUF weights are
-    # already larger than that.
-    with tarfile.open(str(archive_path), mode, format=tarfile.PAX_FORMAT) as tar:
+    # already larger than that. Dereferenced, because restore_assets refuses
+    # link members: a symlink or a second hard link to a weight file is
+    # stored as the file itself, which is also what scan_asset_dir measured.
+    with tarfile.open(str(archive_path), mode, format=tarfile.PAX_FORMAT,
+                      dereference=True) as tar:
         for name in names:
             source = source_root / name
             tar.add(str(source), arcname=name, recursive=False)
@@ -507,6 +556,12 @@ def verify_bundle(bundle_dir):
     except (FileNotFoundError, ValueError) as error:
         return [str(error)]
 
+    # Checked first: every name below is joined onto bundle_dir, and the
+    # checksums cannot vouch for a manifest that shipped beside them.
+    problems = manifest_name_problems(manifest)
+    if problems:
+        return problems
+
     checksum_file = bundle_dir / release_bundle.CHECKSUM_NAME
     if not checksum_file.is_file():
         return [
@@ -533,14 +588,19 @@ def verify_bundle(bundle_dir):
 def restore_assets(bundle_dir, destination) -> Path:
     """Verify, join and extract a bundle into `destination`.
 
-    Nothing is extracted until the parts, the joined archive and the member
-    names have all checked out — a half-written asset tree is harder to diagnose
-    than a refused transfer.
+    Nothing is extracted until the parts, the joined archive and every member
+    have checked out — a half-written asset tree is harder to diagnose than a
+    refused transfer.
     """
     bundle_dir = Path(bundle_dir)
     destination = Path(destination)
 
     problems = verify_bundle(bundle_dir)
+    if not problems:
+        # verify_bundle checked the names on its own read; check them again
+        # on the copy whose names are about to be joined onto real paths.
+        manifest = read_asset_manifest(bundle_dir)
+        problems = manifest_name_problems(manifest)
     if problems:
         raise BundleIntegrityError(
             "Asset bundle in {} failed verification:\n  {}".format(
@@ -548,7 +608,6 @@ def restore_assets(bundle_dir, destination) -> Path:
             )
         )
 
-    manifest = read_asset_manifest(bundle_dir)
     parts = [bundle_dir / part["name"] for part in manifest["parts"]]
     destination.mkdir(parents=True, exist_ok=True)
 
@@ -570,13 +629,16 @@ def restore_assets(bundle_dir, destination) -> Path:
                 )
             )
         with tarfile.open(str(archive), "r:*") as tar:
-            rejected = unsafe_members(tar.getnames())
+            members = tar.getmembers()
+            rejected = unsafe_members(members)
             if rejected:
                 raise BundleIntegrityError(
-                    "Archive {} contains members that would write outside {}: "
-                    "{}".format(archive.name, destination, ", ".join(rejected))
+                    "Archive {} contains members that are links or special "
+                    "files, or would write outside {}: {}".format(
+                        archive.name, destination, ", ".join(rejected)
+                    )
                 )
-            tar.extractall(str(destination))
+            tar.extractall(str(destination), members=members)
     finally:
         shutil.rmtree(str(staging), ignore_errors=True)
     return destination

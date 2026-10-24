@@ -86,6 +86,24 @@ OCR_VBHC_Portable/
 - CPU thường: ~90-120s/trang
 - GPU RTX 3060+: ~15-25s/trang
 
+### Cảnh báo "OCR chưa trọn vẹn" (trang lỗi)
+→ App kiểm tra từng trang OCR: trang bị cắt cụt, lặp vòng, không có HTML hoặc lẫn lời
+suy luận tiếng Anh của mô hình sẽ được nhận dạng lại một lần. Nếu vẫn lỗi, văn bản
+được lưu **không kèm** nội dung lỗi của trang đó và app báo số trang. Mở văn bản, kiểm
+tra rồi bấm **OCR lại**.
+
+Văn bản OCR trước bản sửa này có thể chứa lời suy luận của mô hình. OCR lại hàng loạt
+(đóng app trước; công cụ tự sao lưu DB thành `documents.db.before-reocr`, lần chạy sau
+thành `.before-reocr.2`, `.3`… nên bản sao lưu đầu tiên không bị ghi đè):
+```cmd
+runtime\python.exe tools\reocr_documents.py --db database\documents.db --doc-ids 2 9
+```
+Thêm `--dry-run` để chỉ OCR và báo cáo trên một bản sao tạm; DB thật không bị ghi.
+
+Cấu hình máy chủ OCR cũ vẫn chọn được để so sánh: `set OCR_KV_LAYOUT=legacy`
+(một bể KV 8192 dùng chung, bật prompt cache) và `set OCR_DISABLE_THINKING=0`
+(không gửi `enable_thinking: false`).
+
 ### "Port 9999 already in use"
 → Có llama-server zombie từ phiên trước. App tự động kill, hoặc:
 ```cmd

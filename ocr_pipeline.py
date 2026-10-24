@@ -8,8 +8,12 @@ from PIL import Image
 
 from app_config import (
     ACTIVE_OCR_MODEL, CHANDRA_PORT, LLAMA_SERVER_HOST, get_poppler_path,
+    select_backend,
 )
-from llama_ocr import LlamaOCR
+from llama_ocr import (
+    PAGE_PROBLEM_LABELS, PAGE_PROBLEM_SEVERITY, LlamaOCR, PageOCR,
+    assess_page, salvage_page,
+)
 from llama_server_manager import LlamaServerManager
 from pdf_rendering import render_pdf_adaptive
 
@@ -25,6 +29,20 @@ LLAMA_AVAILABLE = True
 def has_complete_page_ocr(page_htmls):
     """A document is valid only when every rendered page returned content."""
     return bool(page_htmls) and all(str(page or "").strip() for page in page_htmls)
+
+
+def describe_failed_pages(failed):
+    """User-facing warning for pages the quality gate could not recover."""
+    if not failed:
+        return ""
+    parts = [
+        "trang {} ({})".format(item["page"], item["label"]) for item in failed
+    ]
+    return (
+        "Chưa nhận dạng được trọn vẹn {}. Nội dung lỗi của các trang này không "
+        "được lưu vào văn bản và chỉ mục tìm kiếm; hãy kiểm tra lại và bấm "
+        "\"OCR lại\".".format(", ".join(parts))
+    )
 
 
 class DocumentOCR:
@@ -62,16 +80,33 @@ class DocumentOCR:
         (self.image_save_dir / 'processed').mkdir(exist_ok=True)
 
     def _init_hybrid(self):
-        """Start Chandra Q4 llama-server. No fallback — Vintern legacy removed."""
+        """Start Chandra Q4 llama-server. No fallback — Vintern legacy removed.
+
+        The worker count is decided once, here, and the server gets exactly
+        that many slots: each page in flight owns its slot's context instead
+        of sharing one pool with the others.
+        """
         if not LLAMA_AVAILABLE:
             raise RuntimeError(
                 "llama-server modules unavailable. Required: "
                 "llama_ocr, llama_server_manager, app_config."
             )
+        from hardware_detect import detect_hardware, calculate_optimal_workers
+
+        backend = select_backend()
+        # CPU: llama.cpp already uses every thread; parallel pages only thrash.
+        workers = calculate_optimal_workers(detect_hardware()) if backend == "cuda" else 1
+        self.ocr_workers = max(1, int(workers))
         chandra_url = f"http://{LLAMA_SERVER_HOST}:{CHANDRA_PORT}"
-        logger.info(f"Khởi tạo Chandra OCR 2 Q4 (port {CHANDRA_PORT})...")
+        logger.info(
+            f"Khởi tạo Chandra OCR 2 Q4 (port {CHANDRA_PORT}, {backend}, "
+            f"{self.ocr_workers} workers)..."
+        )
         self._chandra_server = LlamaServerManager(port=CHANDRA_PORT)
-        self._chandra_server.start(timeout=120, model_key=ACTIVE_OCR_MODEL)
+        self._chandra_server.start(
+            timeout=120, backend=backend, model_key=ACTIVE_OCR_MODEL,
+            parallel_slots=self.ocr_workers,
+        )
         self.fullpage_ocr = LlamaOCR(base_url=chandra_url)
         logger.info(f"✓ Chandra OCR 2 Q4 sẵn sàng (port {CHANDRA_PORT})")
 
@@ -134,12 +169,14 @@ class DocumentOCR:
             self.processed_images = images
             pages_count = len(images)
 
-            # Detect hardware + calculate parallel workers
-            hw = detect_hardware()
-            n_workers = calculate_optimal_workers(hw)
+            # Workers = server slots, fixed when the server started; never
+            # send more pages at once than there are slots.
+            n_workers = getattr(self, "ocr_workers", None)
+            if not n_workers:
+                n_workers = calculate_optimal_workers(detect_hardware())
             # Single page → always 1 worker
-            n_workers = min(n_workers, pages_count)
-            logger.info(f"OCR {pages_count} trang, {n_workers} workers (Chandra Q4) | {hw}")
+            n_workers = max(1, min(n_workers, pages_count))
+            logger.info(f"OCR {pages_count} trang, {n_workers} workers (Chandra Q4)")
 
             _fp_model = self.fullpage_ocr or self.ocr_model
             page_widths = [img.size[0] for img in images]
@@ -150,6 +187,16 @@ class DocumentOCR:
             _progress_lock = threading.Lock()
             _cancel_event = threading.Event()
             _tokens_per_page = {}  # page_num → n_tokens
+            _done_pages = set()
+
+            def _status(page_num):
+                """One line that only moves forward. With several workers the
+                pages stream at the same time, and naming the page whose token
+                arrived last made the text flick between them ("Trang 3/9:
+                955 tokens", "Trang 5/9: 510 tokens", ...)."""
+                if n_workers > 1:
+                    return "Đã xong {}/{} trang".format(len(_done_pages), pages_count)
+                return "Đang đọc trang {}/{}".format(page_num, pages_count)
 
             def _make_token_cb(page_num):
                 est_tokens = 1200
@@ -165,32 +212,45 @@ class DocumentOCR:
                                 min(0.95, t / est_tokens)
                                 for t in _tokens_per_page.values()
                             )
+                            status = _status(page_num)
                         overall = min(0.95, total_frac / total_steps)
-                        # Show the page currently generating most tokens
-                        keep_going = progress_callback(overall, 1,
-                            f"Trang {page_num}/{pages_count}: {n_tok} tokens "
-                            f"({n_workers} workers)...")
+                        keep_going = progress_callback(overall, 1, status)
                         if keep_going is False:
                             _cancel_event.set()
                         return keep_going
                     return True
                 return _on_token
 
-            def _ocr_page(page_num, pil_img):
-                """OCR a single page — called from thread pool."""
+            def _ocr_page(page_num, pil_img, retry=False):
+                """OCR a single page and judge it — called from thread pool.
+
+                Returns (page_num, PageOCR); problem is set when the page
+                fails the quality gate (llama_ocr.assess_page).
+                """
+                if _cancel_event.is_set():
+                    return page_num, PageOCR("")
                 try:
-                    if _cancel_event.is_set():
-                        return page_num, ""
                     on_token = _make_token_cb(page_num)
-                    if hasattr(_fp_model, 'ocr_full_page_with_html'):
+                    if hasattr(_fp_model, 'ocr_page'):
+                        page = _fp_model.ocr_page(pil_img, on_token=on_token, retry=retry)
+                    elif hasattr(_fp_model, 'ocr_full_page_with_html'):
                         _, raw_html = _fp_model.ocr_full_page_with_html(pil_img, on_token=on_token)
+                        page = PageOCR(raw_html or "")
                     else:
-                        raw_html = _fp_model.ocr_full_page_like_manual(pil_img)
-                    logger.info(f"Trang {page_num}: {len(raw_html or '')} chars HTML")
-                    return page_num, raw_html or ""
+                        page = PageOCR(_fp_model.ocr_full_page_like_manual(pil_img) or "")
+                    if page.problem is None and not _cancel_event.is_set():
+                        page.problem = assess_page(page.html, page.finish_reason)
                 except Exception as e:
                     logger.error(f"Chandra trang {page_num} lỗi: {e}")
-                    return page_num, ""
+                    page = PageOCR("", problem="error")
+                logger.info(
+                    f"Trang {page_num}{' (thử lại)' if retry else ''}: "
+                    f"{len(page.html or '')} chars HTML, finish={page.finish_reason}, "
+                    f"problem={page.problem}"
+                )
+                with _progress_lock:
+                    _done_pages.add(page_num)
+                return page_num, page
 
             # ── Execute OCR ──
             # Show "server warming up" message — user sees activity during
@@ -207,7 +267,7 @@ class DocumentOCR:
                 # previously ignored, causing worker to run to completion even
                 # after user hit "Hủy", which then triggered terminate() that
                 # corrupted the shared httpx.Client → next OCR returned "".
-                all_page_htmls = []
+                page_results = []
                 for page_num, pil_img in enumerate(images, 1):
                     if progress_callback:
                         keep_going = progress_callback(
@@ -217,35 +277,79 @@ class DocumentOCR:
                         if keep_going is False:
                             logger.info(f"OCR canceled before page {page_num} — exiting")
                             return None, None
-                    _, html = _ocr_page(page_num, pil_img)
+                    _, page = _ocr_page(page_num, pil_img)
                     if _cancel_event.is_set():
                         logger.info(f"OCR canceled during page {page_num} — exiting")
                         return None, None
-                    all_page_htmls.append(html)
+                    page_results.append(page)
             else:
                 # Parallel — ThreadPoolExecutor with N workers
                 logger.info(f"Parallel OCR: {n_workers} workers for {pages_count} pages")
-                all_page_htmls = [""] * pages_count
+                page_results = [PageOCR("", problem="empty")] * pages_count
                 with ThreadPoolExecutor(max_workers=n_workers) as executor:
                     futures = {
                         executor.submit(_ocr_page, i + 1, img): i
                         for i, img in enumerate(images)
                     }
                     for future in as_completed(futures):
-                        page_num, html = future.result()
-                        all_page_htmls[page_num - 1] = html
+                        page_num, page = future.result()
+                        page_results[page_num - 1] = page
                         if _cancel_event.is_set():
                             for pending in futures:
                                 pending.cancel()
                             logger.info("Parallel OCR canceled — pending pages discarded")
                             return None, None
 
-            if not has_complete_page_ocr(all_page_htmls):
-                failed = [
-                    str(index) for index, page in enumerate(all_page_htmls, 1)
-                    if not str(page or "").strip()
-                ]
-                logger.error("OCR thiếu nội dung ở trang: %s", ", ".join(failed))
+            # ── Quality gate: retry rejected pages once, one at a time ──
+            # Sequential so the retry has the server to itself (a page that
+            # overflowed a shared context or timed out under load gets a
+            # clean second chance).
+            rejected = [n for n, page in enumerate(page_results, 1) if page.problem]
+            for page_num in rejected:
+                first = page_results[page_num - 1]
+                if progress_callback:
+                    keep_going = progress_callback(
+                        pages_count / total_steps, 1,
+                        f"Thử lại trang {page_num}/{pages_count} "
+                        f"({PAGE_PROBLEM_LABELS.get(first.problem, first.problem)})..."
+                    )
+                    if keep_going is False:
+                        _cancel_event.set()
+                if _cancel_event.is_set():
+                    logger.info("OCR canceled before retrying page %d — exiting", page_num)
+                    return None, None
+                logger.warning(
+                    "Trang %d bị loại (%s, finish=%s) — thử lại một lần",
+                    page_num, first.problem, first.finish_reason,
+                )
+                _, second = _ocr_page(page_num, images[page_num - 1], retry=True)
+                if _cancel_event.is_set():
+                    logger.info(f"OCR canceled during retry of page {page_num} — exiting")
+                    return None, None
+                # Keep the more usable attempt; ties go to the retry.
+                if (PAGE_PROBLEM_SEVERITY.get(second.problem, 5)
+                        <= PAGE_PROBLEM_SEVERITY.get(first.problem, 5)):
+                    page_results[page_num - 1] = second
+
+            failed_pages = []
+            all_page_htmls = []
+            for page_num, page in enumerate(page_results, 1):
+                if page.problem:
+                    label = PAGE_PROBLEM_LABELS.get(page.problem, page.problem)
+                    failed_pages.append(
+                        {"page": page_num, "problem": page.problem, "label": label}
+                    )
+                    logger.error(
+                        "Trang %d vẫn lỗi sau khi thử lại: %s (finish=%s)",
+                        page_num, page.problem, page.finish_reason,
+                    )
+                    # Never index reasoning prose or a loop as document text.
+                    all_page_htmls.append(salvage_page(page.html, page.problem))
+                else:
+                    all_page_htmls.append(page.html or "")
+
+            if not any(html.strip() for html in all_page_htmls):
+                logger.error("OCR không trang nào dùng được (%d trang)", pages_count)
                 return None, None
 
             # ── Parse HTML → 12 NĐ30 fields ──
@@ -265,6 +369,11 @@ class DocumentOCR:
             )
             filled = sum(1 for v in final_results.values() if v)
             logger.info(f"Parsed fields: {filled}/12 non-empty | orient: {''.join('L' if o=='landscape' else 'P' for o in orientations)}")
+            # Visible to the caller (UI warning); not a document field.
+            final_results["OCR_Failed_Pages"] = failed_pages
+            final_results["OCR_Warning"] = describe_failed_pages(failed_pages)
+            if failed_pages:
+                logger.warning(final_results["OCR_Warning"])
 
             if progress_callback:
                 progress_callback(1.0, 1, "Hoàn thành!")

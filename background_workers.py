@@ -223,11 +223,16 @@ class ReindexWorker(QThread):
         self.requestInterruption()
 
 
+class _StreamCancelled(Exception):
+    """Raised from the token callback to abandon an answer mid-stream."""
+
+
 class AgentWorker(QThread):
     """Run an injected RAG agent and bridge its callbacks to Qt signals."""
 
     step = pyqtSignal(str)
     token = pyqtSignal(str)
+    sources = pyqtSignal(object)
     finished_result = pyqtSignal(object)
     error = pyqtSignal(str)
 
@@ -242,6 +247,9 @@ class AgentWorker(QThread):
         old_step = self.agent.step_cb
         old_token = self.agent.token_cb
         old_cancel = self.agent.cancel_check
+        # Agents without the hook (older fakes, other agents) keep working.
+        has_sources = hasattr(self.agent, "sources_cb")
+        old_sources = getattr(self.agent, "sources_cb", None)
 
         def emit_step(value):
             if old_step:
@@ -249,19 +257,36 @@ class AgentWorker(QThread):
             self.step.emit(value)
 
         def emit_token(value):
+            # The agent only checks cancel_check between model calls, so a
+            # Stop during a long answer used to wait for the whole answer.
+            # Raising here leaves the HTTP stream, and closing it is what
+            # makes llama-server stop generating.
+            if self.canceled:
+                raise _StreamCancelled()
             if old_token:
                 old_token(value)
             self.token.emit(value)
+
+        def emit_sources(value):
+            if old_sources:
+                old_sources(value)
+            self.sources.emit(list(value))
 
         self.agent.step_cb = emit_step
         self.agent.token_cb = emit_token
         self.agent.cancel_check = lambda: self.canceled or bool(
             old_cancel and old_cancel()
         )
+        if has_sources:
+            self.agent.sources_cb = emit_sources
         try:
             self.finished_result.emit(
                 self.agent.ask(self.question, history=self.history)
             )
+        except _StreamCancelled:
+            from rag_agent import AgentResult
+
+            self.finished_result.emit(AgentResult("", [], [], "cancelled"))
         except Exception as exc:
             logger.warning("Agent execution failed")
             self.error.emit(str(exc))
@@ -269,6 +294,8 @@ class AgentWorker(QThread):
             self.agent.step_cb = old_step
             self.agent.token_cb = old_token
             self.agent.cancel_check = old_cancel
+            if has_sources:
+                self.agent.sources_cb = old_sources
 
     def cancel(self):
         self.canceled = True

@@ -9,6 +9,20 @@ from typing import List, Optional, Tuple, Union
 from rag_agent import Citation
 
 
+def _add_meta_column(cursor) -> None:
+    """chat_messages.meta_json, added to databases created before it: the
+    context of each turn (scope, open document, the documents it was
+    about, how it was answered). Additive; older rows keep NULL and older
+    versions of the app ignore the column."""
+    columns = {row[1] for row in cursor.execute("PRAGMA table_info(chat_messages)")}
+    if columns and "meta_json" not in columns:
+        try:
+            cursor.execute("ALTER TABLE chat_messages ADD COLUMN meta_json TEXT")
+        except sqlite3.OperationalError as exc:  # added meanwhile by another connection
+            if "duplicate column" not in str(exc).lower():
+                raise
+
+
 def init_tables(cursor) -> None:
     """Create the chat schema on a caller-owned SQLite transaction."""
     cursor.executescript(
@@ -26,6 +40,7 @@ def init_tables(cursor) -> None:
             content TEXT NOT NULL,
             citations_json TEXT,
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            meta_json TEXT,
             FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
         );
 
@@ -33,6 +48,7 @@ def init_tables(cursor) -> None:
             ON chat_messages(session_id, id);
         """
     )
+    _add_meta_column(cursor)
 
 
 class ChatHistory:
@@ -40,6 +56,7 @@ class ChatHistory:
 
     def __init__(self, db_path: Union[str, Path]):
         self.db_path = str(db_path)
+        self._migrated = False
 
     @contextmanager
     def _connection(self):
@@ -47,6 +64,11 @@ class ChatHistory:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         try:
+            if not self._migrated:
+                # The app migrates on open (DocumentDatabase); a database
+                # opened another way gets the column on first use.
+                _add_meta_column(conn.cursor())
+                self._migrated = True
             yield conn
             conn.commit()
         except Exception:
@@ -108,6 +130,24 @@ class ChatHistory:
                 continue
         return citations
 
+    @staticmethod
+    def _encode_meta(meta: Optional[dict]) -> Optional[str]:
+        if not meta:
+            return None
+        return json.dumps(meta, ensure_ascii=False, sort_keys=True)
+
+    @staticmethod
+    def _decode_meta(value: Optional[str]) -> dict:
+        """The turn context saved with a message; {} for rows saved before
+        it was recorded, or unreadable ones."""
+        if not value:
+            return {}
+        try:
+            meta = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return meta if isinstance(meta, dict) else {}
+
     def new_session(self, title: str) -> int:
         with self._connection() as conn:
             cursor = conn.execute(
@@ -121,7 +161,9 @@ class ChatHistory:
         role: str,
         content: str,
         citations: Optional[List[Citation]] = None,
+        meta: Optional[dict] = None,
     ) -> None:
+        """meta: the turn's context as JSON-able values (see chat_panel)."""
         with self._connection() as conn:
             exists = conn.execute(
                 "SELECT 1 FROM chat_sessions WHERE id = ?", (int(session_id),)
@@ -130,12 +172,13 @@ class ChatHistory:
                 raise ValueError("Phiên trò chuyện không tồn tại")
             conn.execute(
                 "INSERT INTO chat_messages "
-                "(session_id, role, content, citations_json) VALUES (?, ?, ?, ?)",
+                "(session_id, role, content, citations_json, meta_json) VALUES (?, ?, ?, ?, ?)",
                 (
                     int(session_id),
                     str(role),
                     str(content),
                     self._encode_citations(citations),
+                    self._encode_meta(meta),
                 ),
             )
 
@@ -155,7 +198,7 @@ class ChatHistory:
         if exists is None:
             return None, []
         rows = conn.execute(
-                "SELECT id, role, content, citations_json, created_at "
+                "SELECT id, role, content, citations_json, created_at, meta_json "
                 "FROM chat_messages WHERE session_id = ? ORDER BY id",
                 (session_id,),
             ).fetchall()
@@ -166,6 +209,7 @@ class ChatHistory:
                 "content": row["content"],
                 "citations": self._decode_citations(row["citations_json"]),
                 "created_at": row["created_at"],
+                "meta": self._decode_meta(row["meta_json"]),
             }
             for row in rows
         ]
@@ -180,6 +224,23 @@ class ChatHistory:
                 "DELETE FROM chat_sessions WHERE id = ?", (int(session_id),)
             )
             return cursor.rowcount > 0
+
+    def delete_last_message(self, session_id: int, role: str) -> bool:
+        """Drop the session's newest message if it has this role.
+
+        Regenerating an answer replaces it; without this the old answer would
+        come back as a second consecutive reply when the session is reopened.
+        """
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT id, role FROM chat_messages WHERE session_id = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (int(session_id),),
+            ).fetchone()
+            if row is None or row["role"] != role:
+                return False
+            conn.execute("DELETE FROM chat_messages WHERE id = ?", (int(row["id"]),))
+            return True
 
     def list_sessions(self, limit: int = 20) -> List[dict]:
         if limit < 1:

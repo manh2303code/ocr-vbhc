@@ -106,6 +106,74 @@ AUTOSAVE_INTERVAL = 60000  # ms (1 minute)
     
 
 #############################
+#   Chrome icons            #
+#############################
+from PyQt5.QtGui import QFontMetrics, QIconEngine  # noqa: E402  (chrome only)
+
+
+class _StateIconEngine(QIconEngine):
+    """One recoloured icon per state: quiet at rest, darker under the
+    pointer (QIcon.Active), olive when a toggle is on (QIcon.On)."""
+
+    def __init__(self, normal, active=None, on=None):
+        super().__init__()
+        self._normal, self._active, self._on = normal, active, on
+
+    def _pick(self, mode, state):
+        if state == QIcon.On and self._on is not None:
+            return self._on
+        if mode in (QIcon.Active, QIcon.Selected) and self._active is not None:
+            return self._active
+        return self._normal
+
+    def paint(self, painter, rect, mode, state):
+        sub = QIcon.Disabled if mode == QIcon.Disabled else QIcon.Normal
+        self._pick(mode, state).paint(painter, rect, Qt.AlignCenter, sub, QIcon.Off)
+
+    def pixmap(self, size, mode, state):
+        sub = QIcon.Disabled if mode == QIcon.Disabled else QIcon.Normal
+        return self._pick(mode, state).pixmap(size, sub, QIcon.Off)
+
+    def actualSize(self, size, mode, state):
+        return size
+
+    def clone(self):
+        return _StateIconEngine(self._normal, self._active, self._on)
+
+
+def chrome_icon(name, size=18, theme=None, role="tool", on_name=None):
+    """A toolbar/menu icon coloured from the theme tokens.
+
+    Roles: "tool" (secondary text, full text under the pointer, olive when
+    toggled on), "danger" (turns red only under the pointer), "mark" (the
+    olive app mark). on_name swaps the glyph when a toggle is on (moon/sun).
+    """
+    from theme_tokens import colors_for
+    if theme is None:
+        theme = AppThemeManager.instance().current
+    tokens = colors_for(theme)
+    rest = tokens["text_secondary"]
+    hover = tokens["danger"] if role == "danger" else tokens["text"]
+    on = tokens["primary_muted"]
+    if role == "mark":
+        rest = hover = tokens["primary"] if theme == "light" else tokens["primary_muted"]
+    if on_name:
+        on_icon = icon(on_name, size=size, color=rest)
+    elif role == "tool":
+        on_icon = icon(name, size=size, color=on)
+    else:
+        on_icon = None
+    return QIcon(_StateIconEngine(
+        icon(name, size=size, color=rest), icon(name, size=size, color=hover), on_icon,
+    ))
+
+
+def chrome_tooltip(title, shortcut="", hint=""):
+    """'Action', an optional one-line explanation, then the shortcut."""
+    return "\n".join(part for part in (title, hint, shortcut) if part)
+
+
+#############################
 #   PDF Viewer Component    #
 #############################
 class PDFViewer(QWidget):
@@ -158,80 +226,93 @@ class PDFViewer(QWidget):
         
         self.setup_ui()
 
-    def setup_ui(self):
-        from ui_icons import icon
+    # Navigation buttons: attribute, icon, title, command id for the shortcut.
+    NAV_BUTTONS = (
+        ("first_btn", "chevrons-left", "Trang đầu", None),
+        ("prev_btn", "chevron-left", "Trang trước", "previous_page"),
+        ("next_btn", "chevron-right", "Trang sau", "next_page"),
+        ("last_btn", "chevrons-right", "Trang cuối", None),
+        ("zoom_out_btn", "zoom-out", "Thu nhỏ", "zoom_out"),
+        ("zoom_in_btn", "zoom-in", "Phóng to", "zoom_in"),
+        ("rotate_left_btn", "rotate-ccw", "Xoay trái", "rotate_left"),
+        ("rotate_right_btn", "rotate-cw", "Xoay phải", "rotate_right"),
+    )
 
+    def setup_ui(self):
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(0, 0, 0, 0)
-        
-        # Toolbar
-        toolbar = QHBoxLayout()
-        toolbar.setSpacing(5)
-        
-        def tool_button(icon_name, tooltip, callback):
-            button = QPushButton()
-            button.setIcon(icon(icon_name, size=17))
-            button.setToolTip(tooltip)
-            button.setFixedSize(30, 30)
-            button.clicked.connect(callback)
-            return button
+        main_layout.setSpacing(0)
 
-        self.first_btn = tool_button("chevrons-left", "Trang đầu tiên", self.goto_first_page)
-        self.prev_btn = tool_button("chevron-left", "Trang trước", self.previous_page)
+        # Navigation strip: page arrows around an editable page number, zoom,
+        # rotation. Small ghost icon buttons; what each does is in its tooltip.
+        # The main window lifts this strip into the tab bar (take_nav_bar);
+        # the preview dialog keeps it on top of the page.
+        self.nav_bar = QWidget()
+        self.nav_bar.setObjectName("pdf_nav")
+        toolbar = QHBoxLayout(self.nav_bar)
+        toolbar.setContentsMargins(6, 2, 6, 2)
+        toolbar.setSpacing(2)
 
-        # Page label
-        self.page_label = QLabel("Trang: 0/0")
-        self.page_label.setAlignment(Qt.AlignCenter)
-        self.page_label.setMinimumWidth(100)
-        self.page_label.setStyleSheet("font-weight:600;padding:2px 8px;")
+        callbacks = {
+            "first_btn": self.goto_first_page, "prev_btn": self.previous_page,
+            "next_btn": self.next_page, "last_btn": self.goto_last_page,
+            "zoom_out_btn": self.zoom_out, "zoom_in_btn": self.zoom_in,
+            "rotate_left_btn": self.rotate_left, "rotate_right_btn": self.rotate_right,
+        }
+        for attr, _icon_name, title, command_id in self.NAV_BUTTONS:
+            button = QToolButton()
+            button.setAutoRaise(True)
+            button.setFocusPolicy(Qt.NoFocus)
+            button.setToolTip(chrome_tooltip(
+                title, command(command_id).shortcut if command_id else ""))
+            button.clicked.connect(callbacks[attr])
+            setattr(self, attr, button)
 
-        # Page jump controls
+        # The current page is an editable field: type a number, press Enter.
         self.page_edit = QLineEdit()
-        self.page_edit.setMaximumWidth(50)
-        self.page_edit.setPlaceholderText("#")
+        self.page_edit.setObjectName("pdf_page_field")
+        self.page_edit.setAlignment(Qt.AlignCenter)
+        self.page_edit.setFixedWidth(38)
+        self.page_edit.setToolTip(chrome_tooltip("Trang đang xem", hint="Gõ số trang rồi nhấn Enter"))
         self.page_edit.returnPressed.connect(self.jump_to_page)
+        self.page_edit.editingFinished.connect(self._show_current_page_number)
 
-        self.jump_btn = QPushButton("Đến")
-        self.jump_btn.setProperty("variant", "primary")
-        self.jump_btn.setMaximumWidth(64)
-        self.jump_btn.clicked.connect(self.jump_to_page)
+        # "/ 4" — the page count beside the field.
+        self.page_label = QLabel("")
+        self.page_label.setObjectName("pdf_page_total")
 
-        # Next/Last buttons
-        self.next_btn = tool_button("chevron-right", "Trang sau", self.next_page)
-        self.last_btn = tool_button("chevrons-right", "Trang cuối cùng", self.goto_last_page)
+        # Zoom level; clicking it returns to 100% and the original orientation.
+        self.zoom_label = QToolButton()
+        self.zoom_label.setObjectName("pdf_zoom_reset")
+        self.zoom_label.setAutoRaise(True)
+        self.zoom_label.setFocusPolicy(Qt.NoFocus)
+        self.zoom_label.setText("100%")
+        self.zoom_label.setToolTip(chrome_tooltip(
+            "Đặt lại thu phóng", command("zoom_reset").shortcut, "Về 100% và hướng gốc"))
+        self.zoom_label.clicked.connect(self.reset_view)
 
-        # Zoom controls
-        self.zoom_out_btn = tool_button("zoom-out", "Thu nhỏ", self.zoom_out)
-        self.zoom_in_btn = tool_button("zoom-in", "Phóng to", self.zoom_in)
-
-        # Rotate controls
-        self.rotate_left_btn = tool_button("rotate-ccw", "Xoay trái", self.rotate_left)
-        self.rotate_right_btn = tool_button("rotate-cw", "Xoay phải", self.rotate_right)
-
-        # Zoom label
-        self.zoom_label = QLabel("100%")
-        self.zoom_label.setAlignment(Qt.AlignCenter)
-        self.zoom_label.setMinimumWidth(60)
-        self.zoom_label.setStyleSheet("font-weight:600;padding:2px 8px;")
-        # Add controls to toolbar
         toolbar.addWidget(self.first_btn)
         toolbar.addWidget(self.prev_btn)
+        toolbar.addSpacing(4)
+        toolbar.addWidget(self.page_edit)
+        toolbar.addSpacing(4)
         toolbar.addWidget(self.page_label)
+        toolbar.addSpacing(4)
         toolbar.addWidget(self.next_btn)
         toolbar.addWidget(self.last_btn)
-        toolbar.addSpacing(10)
-        toolbar.addWidget(self.page_edit)
-        toolbar.addWidget(self.jump_btn)
         toolbar.addStretch()
+        toolbar.addSpacing(16)
         toolbar.addWidget(self.zoom_out_btn)
         toolbar.addWidget(self.zoom_label)
         toolbar.addWidget(self.zoom_in_btn)
         toolbar.addSpacing(10)
         toolbar.addWidget(self.rotate_left_btn)
         toolbar.addWidget(self.rotate_right_btn)
-        
+        self.apply_theme()
+
         # Image display in scrollable area
         self.scroll_area = QScrollArea()
+        self.scroll_area.setObjectName("pdf_canvas")
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setAlignment(Qt.AlignCenter)
         
@@ -272,18 +353,49 @@ class PDFViewer(QWidget):
         self._content_stack.addWidget(self.scroll_area)
 
         # Add to main layout
-        main_layout.addLayout(toolbar)
+        main_layout.addWidget(self.nav_bar)
         main_layout.addWidget(self._content_stack)
-        
+
         # Set initial state
         self.show_empty_state()
         self.update_controls()
+
+    def take_nav_bar(self) -> QWidget:
+        """Hand the navigation strip to a host (the workspace tab bar)."""
+        self.layout().removeWidget(self.nav_bar)
+        return self.nav_bar
+
+    def set_nav_allowed(self, allowed: bool) -> None:
+        """The host hides the strip while another tab is in front."""
+        self._nav_allowed = bool(allowed)
+        self._sync_nav()
+
+    def _sync_nav(self) -> None:
+        """No strip while nothing is open; in a narrow viewer only the page
+        arrows, the page number and zoom stay (first/last and rotation have
+        shortcuts or are rare)."""
+        compact = 0 < self.width() < 640
+        for attr in ("first_btn", "last_btn", "rotate_left_btn", "rotate_right_btn"):
+            getattr(self, attr).setVisible(not compact)
+        self.nav_bar.setVisible(getattr(self, "_nav_allowed", True)
+                                and not getattr(self, "_empty", True))
+
+    def apply_theme(self, theme=None) -> None:
+        """Recolour the navigation icons from the theme tokens."""
+        for attr, icon_name, _title, _command_id in self.NAV_BUTTONS:
+            getattr(self, attr).setIcon(chrome_icon(icon_name, size=16, theme=theme))
+
+    def _show_current_page_number(self) -> None:
+        """Leaving the page field without Enter shows the current page again."""
+        self.page_edit.setText(str(self.current_page + 1) if self.pages else "")
 
     def _show_state(self, title: str, message: str, action: bool = False) -> None:
         self._state_title.setText(title)
         self._state_message.setText(message)
         self._state_action.setVisible(action)
         self._content_stack.setCurrentWidget(self._state_panel)
+        self._empty = action  # only the empty state offers "Thêm văn bản"
+        self._sync_nav()
 
     def show_empty_state(self) -> None:
         self._show_state(
@@ -300,6 +412,8 @@ class PDFViewer(QWidget):
 
     def show_document_state(self) -> None:
         self._content_stack.setCurrentWidget(self.scroll_area)
+        self._empty = False
+        self._sync_nav()
 
     def load_pdf(self, pdf_path):
         """Load a PDF or image file for preview (sync — kept for compat).
@@ -452,20 +566,18 @@ class PDFViewer(QWidget):
     def update_controls(self):
         """Update navigation controls based on document state"""
         has_doc = len(self.pages) > 0
-        
-        # Update page display
-        if has_doc:
-            self.page_label.setText(f"Trang: {self.current_page + 1}/{len(self.pages)}")
-        else:
-            self.page_label.setText("Trang: 0/0")
-            
+
+        # Update page display: the field holds the page, the label the count.
+        self.page_label.setText(f"/ {len(self.pages)}" if has_doc else "")
+        self._show_current_page_number()
+
         # Enable/disable controls
         self.first_btn.setEnabled(has_doc and self.current_page > 0)
         self.prev_btn.setEnabled(has_doc and self.current_page > 0)
         self.next_btn.setEnabled(has_doc and self.current_page < len(self.pages) - 1)
         self.last_btn.setEnabled(has_doc and self.current_page < len(self.pages) - 1)
         self.page_edit.setEnabled(has_doc)
-        self.jump_btn.setEnabled(has_doc)
+        self.zoom_label.setEnabled(has_doc)
         self.zoom_in_btn.setEnabled(has_doc and self.zoom_idx < len(self.ZOOM_LEVELS) - 1)
         self.zoom_out_btn.setEnabled(has_doc and self.zoom_idx > 0)
         self.rotate_left_btn.setEnabled(has_doc)
@@ -584,10 +696,9 @@ class PDFViewer(QWidget):
             self.current_page = page_num - 1
             self.update_page_display()
             self.update_controls()
-            self.page_edit.clear()
         except ValueError:
-            # Invalid input, do nothing
-            self.page_edit.clear()
+            # Invalid input: show the current page again
+            self._show_current_page_number()
             
     def zoom_in(self):
         """Increase zoom level"""
@@ -644,6 +755,7 @@ class PDFViewer(QWidget):
     def resizeEvent(self, event):
         """Handle resize events"""
         super().resizeEvent(event)
+        self._sync_nav()
         if self.pages:
             self.update_page_display()
 
@@ -1127,540 +1239,524 @@ class CustomImageLabel(QLabel):
 #############################
 #    OCR Result Editor      #
 #############################
+# Editor-only widgets and the tokens they are coloured with; imported here,
+# next to their one user.
+import theme_tokens  # noqa: E402
+from editor_widgets import (  # noqa: E402
+    DOCUMENT_FONT, DatePopup, ElidedLabel, GrowingTextEdit, InlineSelector,
+    SectionHeader, format_document_date, install_wheel_guard, parse_document_date,
+)
+
+_QWIDGETSIZE_MAX = 16777215
+
+
+def _document_font(point_size):
+    font = QFont(DOCUMENT_FONT)
+    font.setPointSizeF(point_size)
+    return font
+
+
 class OCRResultEditor(QWidget):
-    """Editor for OCR results with autosuggestions"""
-    
+    """The document editor: full text above, metadata below, actions at the foot.
+
+    2026-10 redesign (docs/design/minimal-ui-2026-10.md):
+      header     the loại văn bản, and the số hiệu as the small gold mark
+      Toàn văn   the OCR text, read-only, in Times New Roman like the paper
+      Thông tin  label/value rows; values in Times New Roman never hide text:
+                 multi-line values wrap and grow, single-line ones show their
+                 start and carry the full value as tooltip when cut
+      action bar icon tools left; Đặt lại and the one primary button right
+
+    Each section title has an expand button. Expanding one section folds the
+    other to its title row, so either the whole text or every metadata value
+    fills the panel; the same button folds it back. This replaces the old
+    show/hide-metadata toggle in the header.
+    """
+
     ocr_updated = pyqtSignal(int, dict)
     field_changed = pyqtSignal(str, str)  # field_name, new_value
     reocr_requested = pyqtSignal()  # user wants to re-run OCR on current document
 
+    TEXT = "text"
+    META = "meta"
+    # Lines a multi-line value shows in the split layout before it scrolls
+    # on its own. Generous on purpose: the metadata panel already scrolls, and
+    # a scroll inside a scroll hides text; only an unusually long value (a
+    # long list of nơi nhận) stops here. Expanded, every line shows.
+    SPLIT_LINES = {'cqbh': 4, 'nd_chinh': 8, 'noi_nhan': 8, 'chuc_vu': 4}
+    # One value each, usually short, but wrapping (never cut) when long.
+    SINGLE_VALUE_FIELDS = ('so_ki_hieu', 'loai_vb', 'chu_ky')
+    # Share of the panel the metadata may take in the split layout.
+    SPLIT_META_SHARE = 0.5
+    # The one QLineEdit: the date, with its calendar. A legacy worded date can
+    # still be long; it shows its start and the whole value as tooltip.
+    LINE_FIELDS = ('ngay_bh',)
+    URGENCY_LEVELS = (("Không", None), ("Hỏa Tốc", "urgency_hoa_toc"),
+                      ("Thượng Khẩn", "urgency_thuong_khan"), ("Khẩn", "urgency_khan"))
+    SECRECY_LEVELS = (("Không", None), ("Mật", "classif_mat"),
+                      ("Tối Mật", "classif_toi_mat"), ("Tuyệt Mật", "classif_tuyet_mat"))
+
     def __init__(self, db, parent=None):  # Thêm tham số db
         super().__init__(parent)
         self.setObjectName("ocrResultEditor")
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self.db = db  # Lưu database instance
         self.doc_id = None
         self.full_cqbh_text = ""
-        self.current_doc_data = None 
+        self.current_doc_data = None
         self.is_loading = False
-        self._theme_name = AppThemeManager.instance().current
+        self._theme_name = "dark" if AppThemeManager.instance().current == "dark" else "light"
+        self._expanded = None
+        self._date_popup = None
+        self._highlight_terms = []
+        self._split_pending = False
+        self._header_tooltip_file = ""
+        self._van_ban_html_cache = ""
+        self._van_ban_plain = ""
         self.setup_ui()
+        self.apply_theme(self._theme_name)
 
+    # ── Layout ──────────────────────────────────────────────────
     def setup_ui(self):
-        """Z-pattern Pro Editor layout (2026-04-18 v2 per user feedback).
-
-          Header (fixed)     — filename + [Toggle metadata] button (F10)
-          Main area          — Full Text editor, primary reading surface, 9pt
-          Metadata dock      — Compact form fields, togglable. When hidden, Full Text
-                               expands to fill all available vertical space.
-          Action bar (46px)  — Lưu / Đặt lại / OCR lại / Sao chép / Xuất Word
-                               always visible regardless of metadata state.
-        """
         main_layout = QVBoxLayout(self)
-        main_layout.setSpacing(4)
-        main_layout.setContentsMargins(6, 6, 6, 6)
+        main_layout.setSpacing(0)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        self._main_layout = main_layout
+        self.fields = {}
 
-        # ── Header bar ───────────────────────────────────────────
-        # Filename + toggle button. Matches "Z-pattern" top-bar from spec.
-        self._header_bar = QFrame()
-        self._header_bar.setObjectName("ocr_header_bar")
-        self._header_bar.setFixedHeight(38)
-        header_layout = QHBoxLayout(self._header_bar)
-        header_layout.setContentsMargins(12, 4, 8, 4)
-        header_layout.setSpacing(8)
+        main_layout.addWidget(self._build_header())
 
-        # Header font per user spec 2026-04-18: Be Vietnam Pro, Bold, 13pt, Navy.
-        self._file_label = QLabel("— Chưa mở văn bản —")
-        _header_font = QFont("Be Vietnam Pro", 11)
-        _header_font.setBold(True)
-        self._file_label.setFont(_header_font)
-        self._file_label.setProperty("role", "documentTitle")
-        self._file_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        header_layout.addWidget(self._file_label, 1)
+        self._text_header = SectionHeader(
+            "Toàn văn",
+            "Mở rộng toàn văn\nThu gọn phần thông tin để đọc trọn văn bản",
+            "Thu gọn toàn văn\nHiện lại phần thông tin",
+        )
+        self._text_header.toggled.connect(lambda: self.toggle_section(self.TEXT))
+        main_layout.addWidget(self._text_header)
 
-        self._toggle_meta_btn = QToolButton()
-        self._toggle_meta_btn.setText("Ẩn metadata")
-        self._toggle_meta_btn.setIcon(icon("panel-right", size=16))
-        self._toggle_meta_btn.setCheckable(True)
-        self._toggle_meta_btn.setChecked(False)
-        self._toggle_meta_btn.setToolTip("Ẩn/hiện các trường metadata trong trình biên tập")
-        self._toggle_meta_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self._toggle_meta_btn.toggled.connect(self._on_toggle_metadata)
-        header_layout.addWidget(self._toggle_meta_btn)
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setFrameShape(QFrame.NoFrame)
+        text.setProperty("role", "ocrText")
+        text.setFont(_document_font(11))
+        text.setPlaceholderText("Toàn văn sẽ hiện ở đây sau khi OCR.")
+        text.setMinimumHeight(120)
+        self.fields['van_ban_dang_txt'] = text
+        main_layout.addWidget(text, 1)
 
-        main_layout.addWidget(self._header_bar)
+        self._meta_header = SectionHeader(
+            "Thông tin",
+            "Mở rộng thông tin\nHiện đầy đủ mọi trường, thu gọn toàn văn",
+            "Thu gọn thông tin\nHiện lại toàn văn",
+        )
+        self._meta_header.toggled.connect(lambda: self.toggle_section(self.META))
+        main_layout.addWidget(self._meta_header)
 
-        # Metadata scroll area (built later — only contains NON-full-text fields).
         self.scroll_area = QScrollArea()
         self.scroll_area.setObjectName("ocrMetadataScroll")
         self.scroll_area.viewport().setObjectName("ocrMetadataViewport")
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QFrame.NoFrame)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll_area.setWidget(self._build_metadata_form())
+        main_layout.addWidget(self.scroll_area)
 
-        # Form container for metadata (populated below; van_ban_group is
-        # added directly to main_layout, NOT to this form_layout).
-        form_widget = QWidget()
-        form_widget.setObjectName("ocrMetadataForm")
-        self.form_layout = QVBoxLayout(form_widget)
-        self.form_layout.setSpacing(6)
-        self.form_layout.setContentsMargins(4, 4, 4, 4)
+        main_layout.addWidget(self._build_action_bar())
 
-        self.fields = {}
-
-        # ── Compact metadata grid (2026-04-18 v3) ───────────────
-        # Per user spec: all 12 fields in ONE QGridLayout at bottom.
-        # Hard-locked 10pt font — does NOT inherit from theme cascade.
-        # No QGroupBox nesting — each groupbox added 16px padding × 5
-        # groups = 80px wasted vertical space.
-        _LABEL_CSS = "font-size:8pt;font-weight:600;"
-        _INPUT_CSS = "font-family:'Be Vietnam Pro';font-size:9pt;"
-        _TEXT_CSS = "font-family:'Be Vietnam Pro';font-size:9pt;line-height:1.35;"
-
-        def _mk_label(text: str) -> QLabel:
-            lab = QLabel(text)
-            lab.setStyleSheet(_LABEL_CSS)
-            lab.setProperty("role", "metadataLabel")
-            return lab
-
-        # Create all field widgets first.
-        self.fields['cqbh'] = QLineEdit()
-        self.fields['cqbh'].setPlaceholderText("CQBH...")
-        self.fields['cqbh'].setStyleSheet(_INPUT_CSS)
-        completer = QCompleter([])
-        completer.setCaseSensitivity(Qt.CaseInsensitive)
-        self.fields['cqbh'].setCompleter(completer)
-
-        self.cqbh_selector = QComboBox()
-        self.cqbh_selector.addItems(["Tất cả", "Trên", "Dưới"])
-        self.cqbh_selector.setStyleSheet(_INPUT_CSS)
-        self.cqbh_selector.currentTextChanged.connect(self.cqbh_selection_changed)
-        self.cqbh_selector.setFixedWidth(90)
-
-        self.fields['so_ki_hieu'] = QLineEdit()
-        self.fields['so_ki_hieu'].setPlaceholderText("Số ký hiệu...")
-        self.fields['so_ki_hieu'].setStyleSheet(_INPUT_CSS)
-        completer = QCompleter([])
-        completer.setCaseSensitivity(Qt.CaseInsensitive)
-        self.fields['so_ki_hieu'].setCompleter(completer)
-        self.fields['so_ki_hieu'].textChanged.connect(
-            lambda: self.field_changed.emit('so_ki_hieu', self.fields['so_ki_hieu'].text())
-        )
-
-        self.fields['ngay_bh'] = QLineEdit()
-        self.fields['ngay_bh'].setPlaceholderText("dd/mm/yyyy")
-        self.fields['ngay_bh'].setStyleSheet(_INPUT_CSS)
-
-        calendar_btn = QPushButton(icon("calendar", size=16), "")
-        self._calendar_btn = calendar_btn
-        calendar_btn.setObjectName("metadataCalendarButton")
-        calendar_btn.setFixedSize(24, 24)
-        calendar_btn.setIconSize(QSize(14, 14))
-        calendar_btn.setToolTip("Chọn ngày từ lịch")
-        calendar_btn.clicked.connect(self.show_date_picker)
-
-        ngay_bh_wrapper = QHBoxLayout()
-        ngay_bh_wrapper.setContentsMargins(0, 0, 0, 0)
-        ngay_bh_wrapper.setSpacing(3)
-        ngay_bh_wrapper.addWidget(self.fields['ngay_bh'])
-        ngay_bh_wrapper.addWidget(calendar_btn)
-
-        self.fields['loai_vb'] = QLineEdit()
-        self.fields['loai_vb'].setPlaceholderText("Công văn, Quyết định,...")
-        self.fields['loai_vb'].setStyleSheet(_INPUT_CSS)
-        completer = QCompleter([])
-        completer.setCaseSensitivity(Qt.CaseInsensitive)
-        self.fields['loai_vb'].setCompleter(completer)
-
-        self.fields['do_khan'] = QComboBox()
-        self.fields['do_khan'].setStyleSheet(_INPUT_CSS)
-        for text, rgb in [("Không", None), ("Hỏa Tốc", (255, 0, 0)),
-                          ("Thượng Khẩn", (255, 140, 0)), ("Khẩn", (255, 215, 0))]:
-            if rgb is None:
-                self.fields['do_khan'].addItem(QIcon(), text)
-            else:
-                ic = QIcon(); px = QPixmap(12, 12); px.fill(QColor(*rgb))
-                ic.addPixmap(px); self.fields['do_khan'].addItem(ic, text)
-        self.fields['do_khan'].currentTextChanged.connect(
-            lambda: self.field_changed.emit('do_khan', self.fields['do_khan'].currentText())
-        )
-
-        self.fields['do_mat'] = QComboBox()
-        self.fields['do_mat'].setStyleSheet(_INPUT_CSS)
-        for text, rgb in [("Không", None), ("Mật", (255, 182, 193)),
-                          ("Tối Mật", (219, 112, 147)), ("Tuyệt Mật", (128, 0, 128))]:
-            if rgb is None:
-                self.fields['do_mat'].addItem(QIcon(), text)
-            else:
-                ic = QIcon(); px = QPixmap(12, 12); px.fill(QColor(*rgb))
-                ic.addPixmap(px); self.fields['do_mat'].addItem(ic, text)
-        self.fields['do_mat'].currentTextChanged.connect(
-            lambda: self.field_changed.emit('do_mat', self.fields['do_mat'].currentText())
-        )
-
-        self.fields['chuc_vu'] = QLineEdit()
-        self.fields['chuc_vu'].setPlaceholderText("Chức vụ người ký...")
-        self.fields['chuc_vu'].setStyleSheet(_INPUT_CSS)
-        completer = QCompleter([])
-        completer.setCaseSensitivity(Qt.CaseInsensitive)
-        self.fields['chuc_vu'].setCompleter(completer)
-
-        self.chuc_vu_selector = QComboBox()
-        self.chuc_vu_selector.addItems(["Tất cả", "Chức danh"])
-        self.chuc_vu_selector.setStyleSheet(_INPUT_CSS)
-        self.chuc_vu_selector.currentTextChanged.connect(self.chuc_vu_selection_changed)
-        self.chuc_vu_selector.setFixedWidth(90)
-
-        self.fields['chu_ky'] = QLineEdit()
-        self.fields['chu_ky'].setPlaceholderText("Tên người ký...")
-        self.fields['chu_ky'].setStyleSheet(_INPUT_CSS)
-
-        self.fields['nd_chinh'] = QTextEdit()
-        self.fields['nd_chinh'].setPlaceholderText("Nội dung chính...")
-        self.fields['nd_chinh'].setStyleSheet(_TEXT_CSS)
-        self.fields['nd_chinh'].setMinimumHeight(34)
-        self.fields['nd_chinh'].setMaximumHeight(68)
-
-        self.fields['noi_nhan'] = QTextEdit()
-        self.fields['noi_nhan'].setPlaceholderText("Danh sách nơi nhận...")
-        self.fields['noi_nhan'].setStyleSheet(_TEXT_CSS)
-        self.fields['noi_nhan'].setMinimumHeight(34)
-        self.fields['noi_nhan'].setMaximumHeight(68)
-
-        # ── Assemble GRID ───────────────────────────────────────
-        # Label ABOVE input (2026-04-18 v4 per user feedback: labels
-        # squeezing input width horizontally was the root cause of
-        # "pixelated / quá to" text. Stacking label-on-top gives each
-        # input full cell width, and lets the 10pt font render cleanly).
-        form_grid = QGridLayout()
-        form_grid.setContentsMargins(2, 2, 2, 2)
-        form_grid.setHorizontalSpacing(8)
-        form_grid.setVerticalSpacing(7)
-        form_grid.setColumnStretch(0, 1)
-        form_grid.setColumnStretch(1, 1)
-        form_grid.setColumnStretch(2, 1)
-
-        def _cell(label_text, widget):
-            """Vertical stack: small label on top, input below."""
-            box = QVBoxLayout()
-            box.setContentsMargins(0, 0, 0, 0)
-            box.setSpacing(3)
-            lab = _mk_label(label_text)
-            lab.setMinimumHeight(14)
-            lab.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            box.addWidget(lab)
-            if isinstance(widget, QHBoxLayout):
-                box.addLayout(widget)
-            else:
-                box.addWidget(widget)
-            return box
-
-        r = 0
-        # Row 1: Số hiệu | Ngày BH | Loại VB (each takes one col, full width)
-        form_grid.addLayout(_cell("Số hiệu", self.fields['so_ki_hieu']), r, 0)
-        form_grid.addLayout(_cell("Ngày BH", ngay_bh_wrapper), r, 1)
-        form_grid.addLayout(_cell("Loại VB", self.fields['loai_vb']), r, 2)
-        r += 1
-
-        # Row 2: Độ khẩn | Độ mật | (Người ký moved here)
-        form_grid.addLayout(_cell("Độ khẩn", self.fields['do_khan']), r, 0)
-        form_grid.addLayout(_cell("Độ mật", self.fields['do_mat']), r, 1)
-        form_grid.addLayout(_cell("Người ký", self.fields['chu_ky']), r, 2)
-        r += 1
-
-        # Row 3: CQBH (span all 3 cols) with selector
-        cqbh_row = QHBoxLayout()
-        cqbh_row.setContentsMargins(0, 0, 0, 0)
-        cqbh_row.setSpacing(4)
-        cqbh_row.addWidget(self.fields['cqbh'], 1)
-        cqbh_row.addWidget(self.cqbh_selector)
-        form_grid.addLayout(_cell("Cơ quan ban hành", cqbh_row), r, 0, 1, 3)
-        r += 1
-
-        # Row 4: Chức vụ (span all 3 cols) with selector
-        chuc_vu_row = QHBoxLayout()
-        chuc_vu_row.setContentsMargins(0, 0, 0, 0)
-        chuc_vu_row.setSpacing(4)
-        chuc_vu_row.addWidget(self.fields['chuc_vu'], 1)
-        chuc_vu_row.addWidget(self.chuc_vu_selector)
-        form_grid.addLayout(_cell("Chức vụ", chuc_vu_row), r, 0, 1, 3)
-        r += 1
-
-        # Row 5: ND chính (span all 3 cols)
-        form_grid.addLayout(_cell("Nội dung chính", self.fields['nd_chinh']), r, 0, 1, 3)
-        r += 1
-
-        # Row 6: Nơi nhận (span all 3 cols)
-        form_grid.addLayout(_cell("Nơi nhận", self.fields['noi_nhan']), r, 0, 1, 3)
-        r += 1
-
-        self.form_layout.addLayout(form_grid)
-        
-        # Van ban dang txt - Toàn bộ nội dung văn bản dạng text
-        van_ban_group = QGroupBox("Nội dung văn bản dạng Text (OCR)")
-        van_ban_group.setObjectName("ocrTextGroup")
-        van_ban_layout = QVBoxLayout(van_ban_group)
-        van_ban_layout.setContentsMargins(8, 16, 8, 8)
-        van_ban_layout.setSpacing(4)
-
-        # NOTE (2026-04-18): OCR lại / Sao chép / Xuất Word buttons moved
-        # into the single fixed floating action bar at the bottom — see
-        # "Fixed Floating Action Bar" section below. All 5 action buttons
-        # (OCR lại, Sao chép, Xuất Word, Đặt lại, Lưu thay đổi) now live
-        # together in one sticky toolbar per user request.
-
-        self.fields['van_ban_dang_txt'] = QTextEdit()
-        self.fields['van_ban_dang_txt'].setPlaceholderText(
-            "Toàn bộ nội dung văn bản đã được OCR sẽ hiển thị ở đây..."
-        )
-        # Primary reading surface; it fills the panel when metadata is hidden.
-        self.fields['van_ban_dang_txt'].setMinimumHeight(260)
-        self.fields['van_ban_dang_txt'].setReadOnly(True)
-        self.fields['van_ban_dang_txt'].setFont(QFont("Be Vietnam Pro", 9))
-        # Same compact Vietnamese-optimized font as the extracted fields.
-        self.fields['van_ban_dang_txt'].setProperty("role", "ocrText")
-        # Cache raw HTML from Chandra for DOCX export
-        self._van_ban_html_cache = ""
-
-        van_ban_layout.addWidget(self.fields['van_ban_dang_txt'])
-        # NOTE: van_ban_group is NOT added to form_layout — it goes directly
-        # into main_layout as the top 70% section (see assembly below).
-
-        # Finalize metadata form in scroll area.
-        self.scroll_area.setWidget(form_widget)
-
-        # Balance reading and editing: on a laptop the complete compact form
-        # should be visible before the user needs to scroll. OCR still keeps
-        # the larger share and expands to 100% when metadata is hidden.
-        self.scroll_area.setMinimumHeight(230)
-        self.scroll_area.setMaximumHeight(370)
-        main_layout.addWidget(van_ban_group, 45)
-        main_layout.addWidget(self.scroll_area, 55)
-
-        # Field-change monitoring (dirty tracking for save button).
+        # Dirty tracking for the save button. The full text is read-only and
+        # re-rendered on theme changes and search highlights, so it is not a
+        # user edit and stays out.
         for field_id, widget in self.fields.items():
-            if field_id != 'cqbh':
-                if isinstance(widget, QLineEdit):
-                    widget.textChanged.connect(self.content_changed)
-                elif isinstance(widget, QTextEdit):
-                    widget.textChanged.connect(self.content_changed)
-                elif isinstance(widget, QComboBox):
-                    widget.currentTextChanged.connect(self.content_changed)
+            if field_id == 'van_ban_dang_txt':
+                continue
+            if isinstance(widget, QLineEdit):
+                widget.textChanged.connect(self.content_changed)
+            elif isinstance(widget, QTextEdit):
+                widget.textChanged.connect(self.content_changed)
+            elif isinstance(widget, QComboBox):
+                widget.currentTextChanged.connect(self.content_changed)
 
         # Live-refresh header bar when so_ki_hieu / loai_vb change.
         self.fields['so_ki_hieu'].textChanged.connect(self._refresh_header_live)
         self.fields['loai_vb'].textChanged.connect(self._refresh_header_live)
+        for key in self.LINE_FIELDS:
+            self.fields[key].textChanged.connect(
+                lambda *_args, k=key: self._sync_line_tooltip(self.fields[k])
+            )
+        for key in (*self.SPLIT_LINES, *self.SINGLE_VALUE_FIELDS):
+            self.fields[key].height_changed.connect(self._schedule_split)
 
-        # ── Fixed Floating Action Bar ──────────────────────────
-        # Consolidated toolbar containing ALL 5 action buttons per user
-        # feedback 2026-04-18: "Các nút 'Lưu', 'Xóa', 'OCR lại' nên nằm
-        # gọn gàng trong một thanh công cụ (Mini-toolbar) ở dưới cùng,
-        # cố định vị trí (Fixed position) để dù người dùng cuộn lên
-        # xuống vẫn thấy nút Lưu."
-        #
-        # Layout (left → right):
-        #   [dirty hint]  [OCR lại] [Sao chép] [Xuất Word]  ··· stretch ···  [Đặt lại] [Lưu]
+        self.set_expanded(None)
+
+    def _build_header(self):
+        """Loại văn bản, then the số hiệu as the gold mark; nothing else."""
+        self._header_bar = QFrame()
+        self._header_bar.setObjectName("ocr_header_bar")
+        self._header_bar.setFixedHeight(36)
+        layout = QHBoxLayout(self._header_bar)
+        layout.setContentsMargins(12, 6, 12, 2)
+        layout.setSpacing(8)
+        self._doc_type_label = ElidedLabel("Chưa mở văn bản")
+        self._doc_type_label.setProperty("role", "documentType")
+        # Both elide rather than widen the panel; the number carries its full
+        # text in the tooltip.
+        self._doc_number_label = ElidedLabel("")
+        self._doc_number_label.setProperty("role", "documentNumber")
+        self._doc_number_label.hide()
+        layout.addWidget(self._doc_type_label)
+        layout.addWidget(self._doc_number_label)
+        layout.addStretch(1)
+        return self._header_bar
+
+    def _build_metadata_form(self):
+        """Label/value rows in the order the fields appear on the paper."""
+        form_widget = QWidget()
+        form_widget.setObjectName("ocrMetadataForm")
+        self._form_widget = form_widget
+        self.form_layout = QVBoxLayout(form_widget)
+        self.form_layout.setContentsMargins(12, 2, 12, 12)
+        self.form_layout.setSpacing(0)
+
+        def line(key, placeholder=""):
+            edit = QLineEdit()
+            edit.setProperty("role", "metadataValue")
+            edit.setFont(_document_font(10.5))
+            if placeholder:
+                edit.setPlaceholderText(placeholder)
+            self.fields[key] = edit
+            return edit
+
+        def growing(key):
+            single = key in self.SINGLE_VALUE_FIELDS
+            edit = GrowingTextEdit(min_lines=1, single_line=single,
+                                   max_lines=None if single else self.SPLIT_LINES[key])
+            edit.setProperty("role", "metadataValue")
+            edit.setFont(_document_font(10.5))
+            self.fields[key] = edit
+            return edit
+
+        def level(key, levels):
+            combo = QComboBox()
+            combo.setProperty("role", "metadataValue")
+            combo.setFont(_document_font(10.5))
+            combo.setIconSize(QSize(8, 8))
+            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(6)
+            combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            for text, _token in levels:
+                combo.addItem(QIcon(), text)
+            combo.currentTextChanged.connect(
+                lambda value, k=key: self.field_changed.emit(k, value)
+            )
+            self.fields[key] = combo
+            return combo
+
+        def selector(items, tip):
+            combo = InlineSelector(items)
+            combo.setProperty("role", "metadataSelector")
+            combo.setToolTip(tip)
+            combo.setCursor(QCursor(Qt.PointingHandCursor))
+            return combo
+
+        for key in self.SINGLE_VALUE_FIELDS:
+            growing(key)
+        for key in ('so_ki_hieu', 'loai_vb'):
+            completer = QCompleter([])
+            completer.setCaseSensitivity(Qt.CaseInsensitive)
+            self.fields[key].setCompleter(completer)
+        self.fields['so_ki_hieu'].textChanged.connect(
+            lambda: self.field_changed.emit('so_ki_hieu', self.fields['so_ki_hieu'].text())
+        )
+
+        date_edit = line('ngay_bh', "dd/mm/yyyy")
+        self._date_action = date_edit.addAction(QIcon(), QLineEdit.TrailingPosition)
+        self._date_action.setToolTip("Chọn ngày từ lịch\nAlt+↓")
+        self._date_action.triggered.connect(self.show_date_picker)
+        date_edit.editingFinished.connect(self._normalize_typed_date)
+        date_edit.installEventFilter(self)
+
+        for key in ('cqbh', 'nd_chinh', 'noi_nhan', 'chuc_vu'):
+            growing(key)
+        level('do_khan', self.URGENCY_LEVELS)
+        level('do_mat', self.SECRECY_LEVELS)
+
+        self.cqbh_selector = selector(
+            ["Tất cả", "Trên", "Dưới"],
+            "Dòng đang sửa\nTất cả: cả hai dòng; Trên: cơ quan chủ quản;\n"
+            "Dưới: cơ quan ban hành",
+        )
+        self.cqbh_selector.currentTextChanged.connect(self.cqbh_selection_changed)
+        self.chuc_vu_selector = selector(
+            ["Tất cả", "Chức danh"],
+            "Tất cả: giữ nguyên các dòng (KT., TM., ...)\nChức danh: chỉ dòng cuối",
+        )
+        self.chuc_vu_selector.currentTextChanged.connect(self.chuc_vu_selection_changed)
+
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(4)
+        grid.setColumnStretch(1, 1)
+        self._metadata_grid = grid
+        self._metadata_labels = {}
+
+        def label(text, tip=""):
+            lab = QLabel(text)
+            lab.setProperty("role", "metadataLabel")
+            if tip:
+                lab.setToolTip(tip)
+            self._metadata_labels[text] = lab
+            return lab
+
+        def row(r, text, value, tip="", extra=None):
+            cell = QVBoxLayout()
+            cell.setContentsMargins(0, 0, 0, 0)
+            cell.setSpacing(0)
+            lab = label(text, tip)
+            cell.addWidget(lab, 0, Qt.AlignLeft | Qt.AlignTop)
+            if extra is not None:
+                cell.addWidget(extra, 0, Qt.AlignLeft | Qt.AlignTop)
+            cell.addStretch(1)
+            grid.addLayout(cell, r, 0)
+            grid.addWidget(value, r, 1, Qt.AlignTop)
+
+        row(0, "Cơ quan ban hành", self.fields['cqbh'],
+            "Hai dòng: cơ quan chủ quản ở trên, cơ quan ban hành ở dưới",
+            extra=self.cqbh_selector)
+        row(1, "Số hiệu", self.fields['so_ki_hieu'], "Số, ký hiệu của văn bản")
+        row(2, "Ngày ban hành", self.fields['ngay_bh'],
+            "Gõ ngày dạng dd/mm/yyyy hoặc chọn từ lịch\nAlt+↓")
+        row(3, "Độ khẩn", self.fields['do_khan'])
+        row(4, "Độ mật", self.fields['do_mat'])
+        row(5, "Loại văn bản", self.fields['loai_vb'])
+        row(6, "Nội dung chính", self.fields['nd_chinh'], "Trích yếu nội dung")
+        row(7, "Nơi nhận", self.fields['noi_nhan'])
+        row(8, "Chức vụ", self.fields['chuc_vu'], "Chức vụ người ký",
+            extra=self.chuc_vu_selector)
+        row(9, "Người ký", self.fields['chu_ky'])
+
+        self.form_layout.addLayout(grid)
+        self.form_layout.addStretch(1)
+
+        # Tab follows the rows, each value before its line selector.
+        chain = [self.fields['cqbh'], self.cqbh_selector, self.fields['so_ki_hieu'],
+                 self.fields['ngay_bh'], self.fields['do_khan'], self.fields['do_mat'],
+                 self.fields['loai_vb'], self.fields['nd_chinh'], self.fields['noi_nhan'],
+                 self.fields['chuc_vu'], self.chuc_vu_selector, self.fields['chu_ky']]
+        for first, second in zip(chain, chain[1:]):
+            QWidget.setTabOrder(first, second)
+        return form_widget
+
+    def _build_action_bar(self):
+        """Icon tools on the left; Đặt lại and the one primary button right."""
         action_bar = QFrame()
         self._action_bar = action_bar
         action_bar.setObjectName("ocr_action_bar")
-        action_bar.setFixedHeight(46)
-        action_layout = QHBoxLayout(action_bar)
-        action_layout.setContentsMargins(8, 6, 8, 6)
-        action_layout.setSpacing(5)
+        action_bar.setFixedHeight(44)
+        layout = QHBoxLayout(action_bar)
+        layout.setContentsMargins(8, 6, 12, 6)
+        layout.setSpacing(2)
 
-        # Dirty hint — amber text indicator, left side.
-        self._dirty_hint = QLabel("")
-        self._dirty_hint.setStyleSheet("color:#D97706;font-size:8pt;")
-        action_layout.addWidget(self._dirty_hint)
+        def tool(attr, tip, slot):
+            button = QToolButton()
+            button.setAutoRaise(True)
+            button.setIconSize(QSize(18, 18))
+            button.setFixedSize(30, 30)
+            button.setToolTip(tip)
+            button.setAccessibleName(tip.split("\n", 1)[0])
+            button.setCursor(QCursor(Qt.PointingHandCursor))
+            button.clicked.connect(slot)
+            setattr(self, attr, button)
+            layout.addWidget(button)
+            return button
 
-        # ── Left cluster: document-level actions ─────────────────
-        # OCR lại — accent coral (warning-style), re-OCR is destructive.
-        self.reocr_btn = QPushButton("OCR lại")
-        self.reocr_btn.setIcon(icon("refresh-cw", size=15))
-        self.reocr_btn.setProperty("variant", "gold")
-        self.reocr_btn.setToolTip("Nhận dạng lại văn bản này (khi kết quả bị lỗi hoặc thiếu)")
-        self.reocr_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        self.reocr_btn.setFixedHeight(30)
-        self.reocr_btn.clicked.connect(lambda: self.reocr_requested.emit())
-        action_layout.addWidget(self.reocr_btn)
+        tool("reocr_btn", "OCR lại\nNhận dạng lại văn bản này khi kết quả lỗi hoặc thiếu",
+             lambda: self.reocr_requested.emit())
+        tool("_copy_btn", "Sao chép toàn văn", self._copy_ocr_text)
+        tool("_export_word_btn", "Xuất toàn văn ra Word (.docx)", self._export_ocr_to_word)
+        layout.addStretch(1)
 
-        # Sao chép — icon-only button, compact.
-        _icon_btn_style = ""
-        copy_btn = QPushButton()
-        self._copy_btn = copy_btn
-        copy_btn.setIcon(icon("copy", size=15))
-        copy_btn.setIconSize(QSize(15, 15))
-        copy_btn.setFixedSize(30, 30)
-        copy_btn.setToolTip("Sao chép nội dung văn bản vào clipboard")
-        copy_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        copy_btn.setStyleSheet(_icon_btn_style)
-        copy_btn.clicked.connect(self._copy_ocr_text)
-        action_layout.addWidget(copy_btn)
-
-        # Xuất Word — icon-only button, compact.
-        export_word_btn = QPushButton()
-        self._export_word_btn = export_word_btn
-        export_word_btn.setIcon(icon("file-text", size=15))
-        export_word_btn.setIconSize(QSize(15, 15))
-        export_word_btn.setFixedSize(30, 30)
-        export_word_btn.setToolTip("Xuất nội dung văn bản ra file Word (.docx)")
-        export_word_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        export_word_btn.setStyleSheet(_icon_btn_style)
-        export_word_btn.clicked.connect(self._export_ocr_to_word)
-        action_layout.addWidget(export_word_btn)
-
-        action_layout.addStretch()
-
-        # ── Right cluster: form-level actions ────────────────────
-        # Đặt lại — ghost/secondary button.
         self.reset_btn = QPushButton("Đặt lại")
-        self.reset_btn.setIcon(icon("undo-2", size=15))
         self.reset_btn.setProperty("variant", "ghost")
-        self.reset_btn.setFixedHeight(30)
+        self.reset_btn.setToolTip(
+            "Bỏ các sửa đổi chưa lưu\n{}".format(command("reset").shortcut))
+        self.reset_btn.setCursor(QCursor(Qt.PointingHandCursor))
         self.reset_btn.clicked.connect(self.reset_fields)
-        action_layout.addWidget(self.reset_btn)
+        layout.addWidget(self.reset_btn)
+        layout.addSpacing(6)
 
-        # Lưu — primary olive button, prominent.
         self.save_btn = QPushButton("Lưu thay đổi")
-        self.save_btn.setIcon(icon("save", size=15))
         self.save_btn.setProperty("variant", "primary")
-        self.save_btn.setFixedHeight(30)
-        self.save_btn.setMinimumWidth(116)
+        self.save_btn.setToolTip("Lưu thay đổi\n{}".format(command("save").shortcut))
+        self.save_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        # Never narrower than its label: the layout may not squeeze it.
+        self.save_btn.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         self.save_btn.clicked.connect(self.save_changes)
-        self.save_btn.setEnabled(False)
-        action_layout.addWidget(self.save_btn)
+        layout.addWidget(self.save_btn)
+        self._set_dirty(False)
+        return action_bar
 
-        main_layout.addWidget(action_bar)
+    # ── Expand / collapse ───────────────────────────────────────
+    def expanded_section(self):
+        """None (split), TEXT or META."""
+        return self._expanded
 
-        compact_font = QFont("Be Vietnam Pro", 9)
-        for field_id, widget in self.fields.items():
-            widget.setFont(compact_font)
-            if isinstance(widget, QLineEdit):
-                widget.setMinimumHeight(22)
-                widget.setMaximumHeight(24)
-            elif isinstance(widget, QComboBox):
-                widget.setMinimumHeight(22)
-                widget.setMaximumHeight(24)
+    def toggle_section(self, section):
+        self.set_expanded(None if self._expanded == section else section)
 
-        for key in ('nd_chinh', 'noi_nhan'):
-            self.fields[key].textChanged.connect(self._fit_metadata_text_fields)
-        QTimer.singleShot(0, self._fit_metadata_text_fields)
+    def set_expanded(self, section):
+        if section not in (None, self.TEXT, self.META):
+            raise ValueError("unknown section: {!r}".format(section))
+        self._expanded = section
+        self.fields['van_ban_dang_txt'].setVisible(section != self.META)
+        self.scroll_area.setVisible(section != self.TEXT)
+        self._text_header.set_expanded(section == self.TEXT)
+        self._meta_header.set_expanded(section == self.META)
+        for key, lines in self.SPLIT_LINES.items():
+            self.fields[key].set_max_lines(None if section == self.META else lines)
+        self._main_layout.setStretchFactor(self.scroll_area, 1 if section == self.META else 0)
+        self._update_split()
 
-    def _fit_metadata_text_fields(self) -> None:
-        """Grow multiline fields only as far as their rendered content needs."""
-        for key in ('nd_chinh', 'noi_nhan'):
-            editor = self.fields.get(key)
-            if editor is None:
-                continue
-            width = max(160, editor.viewport().width())
-            editor.document().setTextWidth(width)
-            content_height = editor.document().documentLayout().documentSize().height()
-            editor.setFixedHeight(max(34, min(68, int(content_height + 7))))
+    def _schedule_split(self):
+        if not self._split_pending:
+            self._split_pending = True
+            QTimer.singleShot(0, self._update_split)
 
+    def _update_split(self):
+        """Size the metadata: its natural height, at most half the panel."""
+        self._split_pending = False
+        if self._expanded == self.META:
+            self.scroll_area.setMinimumHeight(0)
+            self.scroll_area.setMaximumHeight(_QWIDGETSIZE_MAX)
+            return
+        if self._expanded == self.TEXT:
+            return
+        natural = self._form_widget.sizeHint().height()
+        fixed = (self._header_bar.height() + self._text_header.height()
+                 + self._meta_header.height() + self._action_bar.height())
+        available = max(0, self.height() - fixed)
+        cap = max(140, int(available * self.SPLIT_META_SHARE))
+        # A ceiling, not a fixed height: a fixed one would become the panel's
+        # minimum and stop the window from getting shorter.
+        self.scroll_area.setMinimumHeight(min(natural, 96))
+        self.scroll_area.setMaximumHeight(max(96, min(natural, cap)))
+
+    # ── Theme ───────────────────────────────────────────────────
     def apply_theme(self, name: str) -> None:
-        """Recolor existing QTextDocument content after a live theme swap."""
+        """Recolour what the stylesheet cannot reach after a theme swap."""
         self._theme_name = "dark" if name == "dark" else "light"
-        text_color = QColor("#E8EBF5" if self._theme_name == "dark" else "#17231B")
-        base_color = QColor("#1A2332" if self._theme_name == "dark" else "#FFFEFA")
+        tokens = theme_tokens.colors_for(self._theme_name)
         editor = self.fields['van_ban_dang_txt']
-
         palette = editor.palette()
-        palette.setColor(QPalette.Text, text_color)
-        palette.setColor(QPalette.Base, base_color)
+        palette.setColor(QPalette.Text, QColor(tokens['text']))
+        palette.setColor(QPalette.Base, QColor(tokens['surface']))
         editor.setPalette(palette)
+        self._render_ocr_text()
+        self._paint_level_icons()
+        if self._date_popup is not None:
+            self._date_popup.apply_theme(self._theme_name)
+        self._refresh_icons()
 
-        document = editor.document()
-        document.setDefaultStyleSheet(
-            "body, div, p, span, table, td, th, li { color: %s; background: transparent; }"
-            % text_color.name()
-        )
-        cursor = QTextCursor(document)
-        cursor.select(QTextCursor.Document)
-        char_format = QTextCharFormat()
-        char_format.setForeground(text_color)
-        cursor.mergeCharFormat(char_format)
-        editor.viewport().update()
+    def _refresh_icons(self):
+        tokens = theme_tokens.colors_for(self._theme_name)
+        tone = tokens['text_secondary']
+        for button, name in ((self.reocr_btn, "scan"), (self._copy_btn, "copy"),
+                             (self._export_word_btn, "word")):
+            button.setIcon(icon(name, size=18, color=tone))
+        self.reset_btn.setIcon(QIcon())
+        self.save_btn.setIcon(QIcon())
+        self._date_action.setIcon(icon("calendar", size=16, color=tokens['text_muted']))
+        for header in (self._text_header, self._meta_header):
+            header.apply_theme(self._theme_name)
 
-        self.set_header_info(
-            self.fields['loai_vb'].text(),
-            self.fields['so_ki_hieu'].text(),
-            getattr(self, '_header_tooltip_file', ''),
-        )
+    def _paint_level_icons(self):
+        """A small dot in the NĐ30 colour of each urgency/secrecy level.
+
+        "Không" has none, so the common value lines up with the other values.
+        """
+        tokens = theme_tokens.colors_for(self._theme_name)
+        for key, levels in (('do_khan', self.URGENCY_LEVELS), ('do_mat', self.SECRECY_LEVELS)):
+            combo = self.fields[key]
+            for index, (_text, token) in enumerate(levels):
+                if not token:
+                    combo.setItemIcon(index, QIcon())
+                    continue
+                pixmap = QPixmap(16, 16)
+                pixmap.fill(Qt.transparent)
+                painter = QPainter(pixmap)
+                painter.setRenderHint(QPainter.Antialiasing, True)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(tokens[token]))
+                painter.drawEllipse(1, 1, 14, 14)
+                painter.end()
+                pixmap.setDevicePixelRatio(2.0)
+                combo.setItemIcon(index, QIcon(pixmap))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        QTimer.singleShot(0, self._fit_metadata_text_fields)
-    
-    def show_date_picker(self):
-        """Show date picker for ngay_bh field"""
-        date_dialog = QDialog(self)
-        date_dialog.setWindowTitle("Chọn ngày")
-        date_dialog.setMinimumSize(300, 300)
-        
-        layout = QVBoxLayout(date_dialog)
-        
-        calendar = QCalendarWidget()
-        layout.addWidget(calendar)
-        
-        # Try to set initial date from current value
-        current_date = self.fields['ngay_bh'].text().strip()
-        if current_date:
-            try:
-                import re as _re
-                # dd/MM/yyyy (primary format from OCR postprocess)
-                for fmt in ['%d/%m/%Y', '%d-%m-%Y', '%d.%m.%Y', '%d/%m/%y']:
-                    try:
-                        date = datetime.strptime(current_date, fmt)
-                        calendar.setSelectedDate(QDate(date.year, date.month, date.day))
-                        break
-                    except:
-                        continue
-                else:
-                    # "ngày DD tháng MM năm YYYY" (legacy format)
-                    m = _re.search(r'(\d{1,2})\s*(?:/|tháng)\s*(\d{1,2})\s*(?:/|năm)\s*(\d{4})', current_date)
-                    if m:
-                        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
-                        calendar.setSelectedDate(QDate(y, mo, d))
-            except:
-                pass
-        
-        # Buttons
-        buttons = QHBoxLayout()
-        ok_btn = QPushButton("Chọn")
-        ok_btn.clicked.connect(date_dialog.accept)
-        cancel_btn = QPushButton("Hủy")
-        cancel_btn.clicked.connect(date_dialog.reject)
-        
-        buttons.addStretch()
-        buttons.addWidget(ok_btn)
-        buttons.addWidget(cancel_btn)
-        layout.addLayout(buttons)
-        
-        if date_dialog.exec_() == QDialog.Accepted:
-            selected_date = calendar.selectedDate()
-            # Format date as dd/mm/yyyy
-            formatted_date = f"{selected_date.day():02d}/{selected_date.month():02d}/{selected_date.year():04d}"
-            self.fields['ngay_bh'].setText(formatted_date)
-            self.content_changed()
+        self._schedule_split()
+        QTimer.singleShot(0, self._sync_line_tooltips)
 
+    # ── Date ────────────────────────────────────────────────────
+    def show_date_picker(self):
+        """Open the calendar popover under the release-date field."""
+        field = self.fields['ngay_bh']
+        if self._date_popup is None:
+            self._date_popup = DatePopup(self)
+            self._date_popup.date_chosen.connect(self._on_date_chosen)
+        self._date_popup.apply_theme(self._theme_name)
+        parsed = parse_document_date(field.text())
+        current = QDate(parsed.year, parsed.month, parsed.day) if parsed else None
+        self._date_popup.open_for(field, current)
+        return self._date_popup
+
+    def _on_date_chosen(self, chosen):
+        field = self.fields['ngay_bh']
+        field.setText(format_document_date(chosen.toPyDate()))
+        field.setCursorPosition(0)
+        self.content_changed()
+
+    def _normalize_typed_date(self):
+        """A date typed as 2/8/2017 or 02-08-2017 is stored as 02/08/2017."""
+        field = self.fields['ngay_bh']
+        if not field.isModified():
+            return
+        field.setModified(False)
+        parsed = parse_document_date(field.text())
+        if parsed is not None:
+            formatted = format_document_date(parsed)
+            if formatted != field.text():
+                field.setText(formatted)
+
+    def eventFilter(self, watched, event):
+        if watched is self.fields.get('ngay_bh') and event.type() == QEvent.KeyPress:
+            if event.key() == Qt.Key_F4 or (
+                    event.key() == Qt.Key_Down and event.modifiers() & Qt.AltModifier):
+                self.show_date_picker()
+                return True
+        return super().eventFilter(watched, event)
+
+    # ── Selectors ───────────────────────────────────────────────
     def chuc_vu_selection_changed(self, selection):
         """Handle change in chuc_vu selection dropdown"""
         if self.is_loading or not self.current_doc_data:
             return
-            
+
         chuc_vu_text = self.current_doc_data[12] or ''
         lines = chuc_vu_text.strip().split('\n')
-        
+
         if selection == "Tất cả":
             self.fields['chuc_vu'].setText(chuc_vu_text.strip())
         elif selection == "Chức danh" and lines:
             self.fields['chuc_vu'].setText(lines[-1].strip())
-        
+
         self.content_changed()
 
     def cqbh_selection_changed(self, selection):
         """Handle change in cqbh selection dropdown"""
         if self.is_loading:
             return
-            
+
         if self.full_cqbh_text:
             lines = self.full_cqbh_text.strip().split('\n')
             if selection == "Tất cả":
@@ -1674,8 +1770,14 @@ class OCRResultEditor(QWidget):
     def content_changed(self):
         """Enable save button when content changes"""
         if not self.is_loading and self.doc_id is not None:
-            self.save_btn.setEnabled(True)
+            self._set_dirty(True)
 
+    def _set_dirty(self, dirty):
+        """Lưu and Đặt lại only offer themselves when there is a change."""
+        self.save_btn.setEnabled(dirty)
+        self.reset_btn.setEnabled(dirty)
+
+    # ── Header ──────────────────────────────────────────────────
     def _refresh_header_live(self) -> None:
         """Update header bar from current field values as user types."""
         if getattr(self, 'is_loading', False):
@@ -1684,20 +1786,10 @@ class OCRResultEditor(QWidget):
             self.set_header_info(
                 self.fields['loai_vb'].text(),
                 self.fields['so_ki_hieu'].text(),
-                getattr(self, '_header_tooltip_file', ''),
+                self._header_tooltip_file,
             )
         except (KeyError, AttributeError):
             pass
-
-    def _on_toggle_metadata(self, hide: bool) -> None:
-        """Toggle metadata dock visibility. Full Text expands into freed space."""
-        if hide:
-            self.scroll_area.hide()
-            self._toggle_meta_btn.setText("Hiện metadata")
-        else:
-            self.scroll_area.show()
-            self._toggle_meta_btn.setText("Ẩn metadata")
-            self.scroll_area.verticalScrollBar().setValue(0)
 
     def set_current_filename(self, filename: str) -> None:
         """Legacy filename-only setter — kept as tooltip source.
@@ -1705,70 +1797,33 @@ class OCRResultEditor(QWidget):
         Visible header content is set by set_header_info(loai_vb, so_ki_hieu).
         """
         self._header_tooltip_file = filename or ""
-        self._file_label.setToolTip(filename or "")
+        self._doc_type_label.setToolTip(self._header_tooltip_file)
+        self._doc_number_label.setToolTip("\n".join(
+            part for part in (self._doc_number_label.full_text(), self._header_tooltip_file) if part))
 
     def set_header_info(self, loai_vb: str, so_ki_hieu: str,
                         filename: str = "") -> None:
-        """Update header bar with document identity.
+        """Show the document's identity: its type, then its number in gold.
 
-        Format (per user spec 2026-04-18):
-            {Loại VB}   Số:  {SỐ HIỆU IN HOA size to}
-
-        so_ki_hieu is emphasized: bold, uppercase, larger font, brand olive.
-        Falls back to filename if both identity fields empty.
+        The two are separate labels (no "·" string between them). With
+        neither known the header shows the file name, or that nothing is open.
         """
+        if filename:
+            self._header_tooltip_file = filename
+        name = self._header_tooltip_file
         loai = (loai_vb or "").strip()
         so = (so_ki_hieu or "").strip()
-
         if not loai and not so:
-            display = filename or "— Chưa mở văn bản —"
-            self._file_label.setTextFormat(Qt.PlainText)
-            self._file_label.setText(display)
-            self._file_label.setToolTip(filename or "")
-            return
-
-        # Standardized header markup — ALL tokens use the same font family.
-        # Previously each span inherited different font from cascade →
-        # header looked different per document. Now every span explicitly
-        # declares font-family + sizes from a fixed set (11pt/13pt).
-        _ff = "font-family:'Be Vietnam Pro','Segoe UI',sans-serif"
-        if self._theme_name == "dark":
-            type_color, muted_color, number_color = "#7EA2E8", "#A8B2D1", "#E5C466"
+            self._doc_type_label.set_full_text(name or "Chưa mở văn bản")
         else:
-            type_color, muted_color, number_color = "#3B5998", "#5F687C", "#0F2B5B"
-        loai_html = (
-            f"<span style=\"{_ff}; color:{type_color}; font-size:10pt;"
-            f" font-weight:600;\">{self._esc(loai)}</span>"
-            if loai else ""
-        )
-        separator = (
-            f"<span style=\"{_ff}; color:{muted_color};\">&nbsp;·&nbsp;</span>"
-            if loai and so else ""
-        )
-        if so:
-            so_html = (
-                f"<span style=\"{_ff}; color:{muted_color}; font-size:10pt;"
-                f" font-weight:500;\">Số:&nbsp;</span>"
-                f"<span style=\"{_ff}; color:{number_color}; font-size:12pt;"
-                f" font-weight:700; letter-spacing:1px;\">"
-                f"{self._esc(so.upper())}</span>"
-            )
-        else:
-            so_html = ""
+            self._doc_type_label.set_full_text(loai)
+        self._doc_type_label.setVisible(bool(self._doc_type_label.full_text()))
+        self._doc_number_label.set_full_text(so)
+        self._doc_number_label.setVisible(bool(so))
+        self._doc_type_label.setToolTip(name)
+        self._doc_number_label.setToolTip("\n".join(part for part in (so, name) if part))
 
-        self._file_label.setTextFormat(Qt.RichText)
-        self._file_label.setText(loai_html + separator + so_html)
-        self._file_label.setToolTip(filename or "")
-
-    @staticmethod
-    def _esc(text: str) -> str:
-        """Escape HTML reserved chars for safe rich-text rendering."""
-        return (
-            text.replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;")
-        )
-
+    # ── Data ────────────────────────────────────────────────────
     def load_data(self, doc_data):
         """Load document data into the editor fields"""
         self.is_loading = True
@@ -1785,20 +1840,21 @@ class OCRResultEditor(QWidget):
             self.doc_id = doc_data[1]  # Sử dụng document_id thay vì version id
         else:
             self.doc_id = doc_data[0]  # Sử dụng ID phiên bản nếu không có document_id
-        
+
         # Build CQBH from parts
         cqbh_tren = doc_data[3] or ""
         cqbh_duoi = doc_data[4] or ""
         self.full_cqbh_text = "\n".join([part for part in [cqbh_tren, cqbh_duoi] if part])
-        
+
         # Keep track of parts separately
         self.cqbh_selector.setCurrentText("Tất cả")
+        self.chuc_vu_selector.setCurrentText("Tất cả")
         self.fields['cqbh'].setText(self.full_cqbh_text)
-        
+
         # Set other fields - theo thứ tự mới: cơ quan ban hành, số ký hiệu, ngày ban hành, độ khẩn, độ mật, loại văn bản
         self.fields['so_ki_hieu'].setText(doc_data[5] or "")
         self.fields['ngay_bh'].setText(doc_data[6] or "")
-        
+
         # Set độ khẩn with proper display
         do_khan = doc_data[7] or "Không"
         index = self.fields['do_khan'].findText(do_khan)
@@ -1806,7 +1862,7 @@ class OCRResultEditor(QWidget):
             self.fields['do_khan'].setCurrentIndex(index)
         else:
             self.fields['do_khan'].setCurrentIndex(0)  # Default to "Không"
-            
+
         # Set độ mật with proper display
         do_mat = doc_data[8] or "Không"
         index = self.fields['do_mat'].findText(do_mat)
@@ -1814,13 +1870,13 @@ class OCRResultEditor(QWidget):
             self.fields['do_mat'].setCurrentIndex(index)
         else:
             self.fields['do_mat'].setCurrentIndex(0)  # Default to "Không"
-            
+
         self.fields['loai_vb'].setText(doc_data[9] or "")
         self.fields['nd_chinh'].setText(doc_data[10] or "")
         self.fields['noi_nhan'].setText(doc_data[11] or "")
         self.fields['chuc_vu'].setText(doc_data[12] or "")
         self.fields['chu_ky'].setText(doc_data[13] or "")
-        
+
         # Load van_ban_dang_txt - toàn bộ text OCR.
         # Schema migration quirk (2026-04-19): column index differs between
         # databases depending on CREATE TABLE vs ALTER TABLE order.
@@ -1846,47 +1902,65 @@ class OCRResultEditor(QWidget):
             if len(_s) > 40 or '<div' in _s or '\n' in _s:
                 raw_text = _s
                 break
-        if raw_text:
-            # Detect Chandra HTML output (contains <div> tags) — render as HTML
-            if '<div' in raw_text and ('data-label' in raw_text or 'data-bbox' in raw_text or 'data=' in raw_text):
-                self._van_ban_html_cache = raw_text
-                self.fields['van_ban_dang_txt'].setHtml(
-                    self._build_display_html(raw_text)
-                )
-            else:
-                self._van_ban_html_cache = ""
-                self.fields['van_ban_dang_txt'].setPlainText(raw_text)
-        else:
-            self._van_ban_html_cache = ""
-            self.fields['van_ban_dang_txt'].clear()
-        
-        # Refresh Z-pattern header bar with loai_vb + so_ki_hieu.
-        # Keeps the filename fallback available via tooltip.
-        if hasattr(self, 'set_header_info'):
-            self.set_header_info(
-                doc_data[9] if len(doc_data) > 9 else "",
-                doc_data[5] if len(doc_data) > 5 else "",
-                getattr(self, '_header_tooltip_file', ''),
-            )
+        # Chandra HTML output (contains <div> tags) renders as HTML.
+        is_chandra_html = bool(raw_text) and '<div' in raw_text and (
+            'data-label' in raw_text or 'data-bbox' in raw_text or 'data=' in raw_text)
+        self._van_ban_html_cache = raw_text if is_chandra_html else ""
+        self._van_ban_plain = "" if is_chandra_html else raw_text
+        self._highlight_terms = []
+        self._render_ocr_text()
+        self.fields['van_ban_dang_txt'].verticalScrollBar().setValue(0)
+
+        # Refresh the header with loai_vb + so_ki_hieu; the file name stays
+        # available as its tooltip.
+        self.set_header_info(
+            doc_data[9] if len(doc_data) > 9 else "",
+            doc_data[5] if len(doc_data) > 5 else "",
+        )
 
         # Reset state
         self.is_loading = False
-        self.save_btn.setEnabled(False)
+        self._set_dirty(False)
+        self._show_line_starts()
         self.scroll_area.verticalScrollBar().setValue(0)
         QTimer.singleShot(0, self._finish_loading_layout)
 
     def _finish_loading_layout(self) -> None:
+        self._update_split()
+        self._show_line_starts()
         self.scroll_area.verticalScrollBar().setValue(0)
-        self._fit_metadata_text_fields()
+
+    def _show_line_starts(self):
+        """Every value shows its start, not its end."""
+        for key in self.LINE_FIELDS:
+            edit = self.fields[key]
+            edit.setCursorPosition(0)
+            self._sync_line_tooltip(edit)
+        for key in (*self.SPLIT_LINES, *self.SINGLE_VALUE_FIELDS):
+            self.fields[key].setCursorPosition(0)
+            self.fields[key].verticalScrollBar().setValue(0)
+
+    def _sync_line_tooltips(self):
+        for key in self.LINE_FIELDS:
+            self._sync_line_tooltip(self.fields[key])
+
+    @staticmethod
+    def _sync_line_tooltip(edit):
+        """The full value as tooltip, only when the field cuts it."""
+        text = edit.text()
+        # leave room for the text margins and any icon inside the field
+        room = edit.contentsRect().width() - 6 - 24 * len(edit.actions())
+        cut = bool(text) and edit.fontMetrics().horizontalAdvance(text) > room
+        edit.setToolTip(text if cut else "")
 
     def get_current_data(self):
         """Get current data from all fields"""
         data = {}
-        
+
         # Handle CQBH based on selection
         lines = self.full_cqbh_text.strip().split('\n')
         selection = self.cqbh_selector.currentText()
-        
+
         if selection == "Trên":
             data['cqbh_tren'] = self.fields['cqbh'].text()
             data['cqbh_duoi'] = lines[1] if len(lines) > 1 else ''
@@ -1897,7 +1971,7 @@ class OCRResultEditor(QWidget):
             parts = self.fields['cqbh'].text().split('\n')
             data['cqbh_tren'] = parts[0] if parts else ''
             data['cqbh_duoi'] = parts[1] if len(parts) > 1 else ''
-        
+
         # Get other fields
         for field_id, editor in self.fields.items():
             if field_id != 'cqbh':
@@ -1906,11 +1980,15 @@ class OCRResultEditor(QWidget):
                     data[field_id] = editor.currentText()
                 elif field_id == 'van_ban_dang_txt' and self._van_ban_html_cache:
                     data[field_id] = self._van_ban_html_cache
+                elif isinstance(editor, GrowingTextEdit):
+                    # text() keeps the value exactly (toPlainText would
+                    # replace non-breaking spaces).
+                    data[field_id] = editor.text().strip()
                 elif isinstance(editor, QTextEdit):
                     data[field_id] = editor.toPlainText().strip()
                 else:
                     data[field_id] = editor.text().strip()
-        
+
         return data
 
     def save_changes(self):
@@ -1918,25 +1996,25 @@ class OCRResultEditor(QWidget):
         if self.doc_id is None:
             QMessageBox.warning(None, "Cảnh báo", "Không có tài liệu nào được chọn để lưu.")
             return
-            
+
         try:
             # Kiểm tra document tồn tại
             doc_info = self.db.get_document_info(self.doc_id)
             if not doc_info:
                 # Hiển thị cảnh báo hữu ích hơn
-                QMessageBox.warning(None, "Cảnh báo", 
+                QMessageBox.warning(None, "Cảnh báo",
                           f"Không tìm thấy tài liệu với ID {self.doc_id}.\nVui lòng làm mới danh sách tài liệu và thử lại.")
-                self.save_btn.setEnabled(False)
+                self._set_dirty(False)
                 return
-                
+
             data = self.get_current_data()
             # Emit update signal
             self.ocr_updated.emit(self.doc_id, data)
-            self.save_btn.setEnabled(False)
-            
+            self._set_dirty(False)
+
         except Exception as e:
             logger.error(f"Error saving changes: {str(e)}")
-            QMessageBox.critical(None, "Lỗi", 
+            QMessageBox.critical(None, "Lỗi",
                             f"Lỗi khi lưu thay đổi: {str(e)}\nVui lòng thử lại.")
 
     def reset_fields(self):
@@ -1948,7 +2026,7 @@ class OCRResultEditor(QWidget):
         """Update suggestions for all fields from database"""
         try:
             for field_id, editor in self.fields.items():
-                if isinstance(editor, QLineEdit):
+                if isinstance(editor, (QLineEdit, GrowingTextEdit)):
                     suggestions = db.get_suggestions(field_id)
                     completer = QCompleter(suggestions)
                     completer.setCaseSensitivity(Qt.CaseInsensitive)
@@ -1964,6 +2042,9 @@ class OCRResultEditor(QWidget):
             self.doc_id = None
             self.full_cqbh_text = ""
             self.current_doc_data = None
+            self._van_ban_html_cache = ""
+            self._van_ban_plain = ""
+            self._highlight_terms = []
 
             for field_id, editor in self.fields.items():
                 if isinstance(editor, QComboBox):
@@ -1971,58 +2052,63 @@ class OCRResultEditor(QWidget):
                 elif isinstance(editor, QTextEdit):
                     editor.clear()
                 else:
-                    editor.setText("")  
-            
-            self.save_btn.setEnabled(False)
+                    editor.setText("")
+
+            self._header_tooltip_file = ""
+            self.set_header_info("", "", "")
+            self._set_dirty(False)
         finally:
             self.is_loading = False
-            
-    def highlight_keywords(self, keywords: list):
+
+    # ── Full text ───────────────────────────────────────────────
+    def _render_ocr_text(self):
+        """Show the full text for the current theme, keeping the scroll place.
+
+        Chandra HTML is rendered with the theme's tokens (table rules); the
+        text colour itself is the widget's, so a theme swap recolours it.
+        Search highlights are applied again on top.
         """
-        Highlight keywords in the van_ban_dang_txt field.
-        
-        Args:
-            keywords: List of keywords to highlight
+        editor = self.fields['van_ban_dang_txt']
+        bar = editor.verticalScrollBar()
+        position = bar.value()
+        if self._van_ban_html_cache:
+            editor.setHtml(self._build_display_html(
+                self._van_ban_html_cache, theme_tokens.colors_for(self._theme_name)))
+        elif self._van_ban_plain:
+            editor.setPlainText(self._van_ban_plain)
+        else:
+            editor.clear()
+        if self._highlight_terms:
+            self._apply_highlights(self._highlight_terms)
+        bar.setValue(position)
+
+    def _apply_highlights(self, terms):
+        tokens = theme_tokens.colors_for(self._theme_name)
+        mark = QTextCharFormat()
+        mark.setBackground(QColor(tokens['accent_gold_soft']))
+        mark.setForeground(QColor(tokens['text']))
+        document = self.fields['van_ban_dang_txt'].document()
+        for term in terms:
+            cursor = QTextCursor(document)
+            while True:
+                cursor = document.find(term, cursor)
+                if cursor.isNull():
+                    break
+                cursor.mergeCharFormat(mark)
+
+    def highlight_keywords(self, keywords: list):
+        """Mark search keywords in the full text, in the gold of the theme.
+
+        The text is rendered again first, so earlier marks go away and
+        Chandra's formatting (headings, tables) stays.
         """
         if 'van_ban_dang_txt' not in self.fields:
             return
-            
-        text_edit = self.fields['van_ban_dang_txt']
-        if not isinstance(text_edit, QTextEdit):
+        terms = [keyword for keyword in (keywords or []) if keyword]
+        if not terms or not self.fields['van_ban_dang_txt'].toPlainText():
             return
-            
-        # Get the current text
-        text = text_edit.toPlainText()
-        if not text or not keywords:
-            return
-        
-        # Store cursor position
-        cursor = text_edit.textCursor()
-        
-        # Clear existing formatting first
-        text_edit.setPlainText(text)
-        
-        # Create highlight format
-        from PyQt5.QtGui import QTextCharFormat
-        highlight_format = QTextCharFormat()
-        highlight_format.setBackground(QColor(255, 255, 0))  # Yellow highlight
-        highlight_format.setForeground(QColor(0, 0, 0))  # Black text
-        
-        # Find and highlight each keyword
-        for keyword in keywords:
-            if not keyword:
-                continue
-                
-            cursor = text_edit.textCursor()
-            cursor.movePosition(cursor.Start)
-            text_edit.setTextCursor(cursor)
-            
-            # Find all occurrences
-            while True:
-                cursor = text_edit.document().find(keyword, cursor)
-                if cursor.isNull():
-                    break
-                cursor.mergeCharFormat(highlight_format)
+        self._highlight_terms = terms
+        self._render_ocr_text()
 
     def _copy_ocr_text(self):
         """Copy OCR text content to clipboard"""
@@ -2037,16 +2123,17 @@ class OCRResultEditor(QWidget):
             QToolTip.showText(QCursor.pos(), "Không có nội dung để sao chép", self, self.rect(), 2000)
 
     @staticmethod
-    def _build_display_html(chandra_html: str) -> str:
+    def _build_display_html(chandra_html: str, colors=None) -> str:
         """Delegate to pure renderer in display_html_renderer module.
 
         Kept as staticmethod for backward-compat with call sites that use
         MainWindow._build_display_html(...). Actual rendering logic is in
         desktop/display_html_renderer.py for isolated unit-testability
-        (no PyQt5/YOLO/torch init required in tests).
+        (no PyQt5/YOLO/torch init required in tests). `colors` is a
+        theme_tokens palette; the light one when omitted.
         """
         from display_html_renderer import build_display_html
-        return build_display_html(chandra_html)
+        return build_display_html(chandra_html, colors)
 
     def _export_ocr_to_word(self):
         """Export OCR to Word — uses html_to_docx for Chandra HTML, plain text fallback."""
@@ -2099,10 +2186,32 @@ class OCRResultEditor(QWidget):
 #############################
 #       Dialog Classes      #
 #############################
-class SpinnerWidget(QWidget):
-    """Widget vòng xoay gradient đỏ cam animated"""
+# The secondary surfaces of the 2026-10 redesign: sheets of the surface
+# colour, styled by object name in the "AREA: dialogs" section of
+# devtools/theme_template.qss. What a stylesheet cannot reach (the painted
+# activity ring, icons) takes its colours from theme_tokens in code.
+import html  # noqa: E402  (dialogs only)
+from PyQt5.QtCore import QRectF  # noqa: E402
 
-    def __init__(self, size=60, parent=None):
+
+def _mark_colour(theme=None):
+    """The olive of the app mark, as the toolbar paints it: the brand fill in
+    the light theme, its text tone in the dark one (where the fill would sink
+    into the surface)."""
+    theme = theme or AppThemeManager.instance().current
+    tokens = theme_tokens.colors_for(theme)
+    return tokens["primary_muted"] if theme == "dark" else tokens["primary"]
+
+
+class SpinnerWidget(QWidget):
+    """The activity ring of the progress window.
+
+    A quarter arc turns over a hairline track while the work runs; when it is
+    done the ring becomes the Fluent check in the success colour. Colours are
+    read from the tokens at paint time, so a theme switch needs nothing else.
+    """
+
+    def __init__(self, size=20, parent=None):
         super().__init__(parent)
         self.setFixedSize(size, size)
         self._angle = 0
@@ -2118,185 +2227,129 @@ class SpinnerWidget(QWidget):
             self._angle = (self._angle + 8) % 360
             self.update()
 
-    def stop(self):
+    def stop(self, done=True):
+        """Stop turning; with done (the default) show the check."""
         self._spinning = False
-        self._completed = True
+        self._completed = done
         self._timer.stop()
         self.update()
 
     def paintEvent(self, event):
+        theme = AppThemeManager.instance().current
+        tokens = theme_tokens.colors_for(theme)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        s = self._size
-        pen_width = 5
-
         if self._completed:
-            # Vẽ checkmark xanh lá
-            painter.setPen(QPen(QColor("#4CAF50"), pen_width, Qt.SolidLine, Qt.RoundCap))
-            cx, cy = s // 2, s // 2
-            r = s // 2 - pen_width
-            painter.drawEllipse(cx - r, cy - r, r * 2, r * 2)
-            # Checkmark
-            painter.setPen(QPen(QColor("#4CAF50"), 4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-            painter.drawLine(int(cx - r * 0.35), int(cy + r * 0.05),
-                             int(cx - r * 0.05), int(cy + r * 0.35))
-            painter.drawLine(int(cx - r * 0.05), int(cy + r * 0.35),
-                             int(cx + r * 0.4), int(cy - r * 0.3))
-        else:
-            # Vẽ arc xoay với gradient đỏ cam
-            rect = QRect(pen_width, pen_width, s - pen_width * 2, s - pen_width * 2)
-            gradient = QConicalGradient(s / 2, s / 2, self._angle)
-            gradient.setColorAt(0.0, QColor("#FF5722"))
-            gradient.setColorAt(0.5, QColor("#FF9800"))
-            gradient.setColorAt(1.0, QColor(255, 87, 34, 40))  # Fade out
-
-            pen = QPen(QBrush(gradient), pen_width, Qt.SolidLine, Qt.RoundCap)
-            painter.setPen(pen)
-            painter.drawArc(rect, self._angle * 16, 270 * 16)
-
-            # Track xám nhạt phía sau
-            painter.setPen(QPen(QColor(230, 230, 230), pen_width - 1, Qt.SolidLine, Qt.RoundCap))
-            painter.drawArc(rect, (self._angle + 270) * 16, 90 * 16)
-
+            icon("status-ok", size=self._size, color=tokens["success"]).paint(painter, self.rect())
+            painter.end()
+            return
+        pen_width = max(2.0, self._size / 10)
+        inset = pen_width / 2 + 0.5
+        ring = QRectF(self.rect()).adjusted(inset, inset, -inset, -inset)
+        painter.setPen(QPen(QColor(tokens["border"]), pen_width))
+        painter.drawEllipse(ring)
+        painter.setPen(QPen(QColor(_mark_colour(theme)), pen_width, Qt.SolidLine, Qt.RoundCap))
+        painter.drawArc(ring, -self._angle * 16, 90 * 16)
         painter.end()
 
 
 class ProgressDialog(QDialog):
-    """Dialog hiện đại hiển thị tiến trình xử lý với spinner animated"""
+    """The OCR progress window: what runs, how far, and how to stop it.
+
+    The activity ring beside a short title and a reassuring line, the thin
+    progress line of the theme, then the current step and the percent as two
+    separate parts. One button: Hủy while it runs, Đóng (the one primary
+    button) once it is done.
+    """
     canceled = pyqtSignal()
+
+    # The line under the title changes as the wait gets longer (seconds).
+    WAIT_MESSAGES = (
+        (10, "Tài liệu đang được xử lý, đồng chí vui lòng chờ giây lát."),
+        (30, "Đang phân tích nội dung văn bản, vui lòng chờ thêm..."),
+        (60, "Văn bản phức tạp cần thêm thời gian, cảm ơn đồng chí đã kiên nhẫn."),
+    )
 
     def __init__(self, total: int, title: str = "Đang xử lý", parent=None):
         super().__init__(parent)
         self.total = max(1, total)
         self.was_canceled = False
         self.is_completed = False
+        self._smooth_timer = None
+        self._smooth_target = 0
         self.setup_ui(title)
 
     def setup_ui(self, title: str):
+        self.setObjectName("progressDialog")
         self.setWindowTitle(title)
         self.setWindowModality(Qt.ApplicationModal)
-        self.setFixedSize(420, 280)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-
-        # Nền trắng bo góc với shadow
-        self.setStyleSheet("""
-            QDialog {
-                background-color: #FFFEFA;
-                border-radius: 12px;
-            }
-        """)
+        self.setFixedSize(440, 182)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(30, 25, 30, 20)
-        layout.setSpacing(10)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(0)
 
-        # Spinner widget (trung tâm)
-        spinner_layout = QHBoxLayout()
-        spinner_layout.addStretch()
-        self.spinner = SpinnerWidget(60, self)
-        spinner_layout.addWidget(self.spinner)
-        spinner_layout.addStretch()
-        layout.addLayout(spinner_layout)
-
-        layout.addSpacing(5)
-
-        # Task label
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        self.spinner = SpinnerWidget(20, self)
+        head.addWidget(self.spinner, 0, Qt.AlignTop)
+        words = QVBoxLayout()
+        words.setSpacing(2)
         self.task_label = QLabel(title)
-        self.task_label.setAlignment(Qt.AlignCenter)
-        self.task_label.setStyleSheet("font-size: 14pt; font-weight: bold; color: #333333;")
-        layout.addWidget(self.task_label)
-
-        # Message chờ
-        self.time_label = QLabel("Tài liệu đang được xử lý, đồng chí vui lòng chờ giây lát.")
-        self.time_label.setAlignment(Qt.AlignCenter)
+        self.task_label.setObjectName("progressTitle")
+        words.addWidget(self.task_label)
+        self.time_label = QLabel(self.WAIT_MESSAGES[0][1])
+        self.time_label.setObjectName("progressMessage")
         self.time_label.setWordWrap(True)
-        self.time_label.setStyleSheet("font-size: 10pt; font-style: italic; color: #666666;")
-        layout.addWidget(self.time_label)
+        words.addWidget(self.time_label)
+        head.addLayout(words, 1)
+        layout.addLayout(head)
+        layout.addSpacing(16)
 
-        layout.addSpacing(5)
-
-        # Progress bar mỏng gradient
         self.progress_bar = QProgressBar()
+        self.progress_bar.setObjectName("progressBar")
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
-        self.progress_bar.setFixedHeight(6)
         self.progress_bar.setTextVisible(False)
-        self.progress_bar.setStyleSheet("""
-            QProgressBar {
-                background-color: #E8E8E8;
-                border: none;
-                border-radius: 3px;
-            }
-            QProgressBar::chunk {
-                border-radius: 3px;
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #FF5722, stop:1 #FF9800);
-            }
-        """)
         layout.addWidget(self.progress_bar)
+        layout.addSpacing(6)
 
-        # Status label
-        self.status_label = QLabel("Đang chuẩn bị...")
-        self.status_label.setAlignment(Qt.AlignCenter)
-        self.status_label.setStyleSheet("font-size: 9pt; color: #888888;")
-        layout.addWidget(self.status_label)
+        status = QHBoxLayout()
+        status.setSpacing(12)
+        self.status_label = ElidedLabel()
+        self.status_label.setObjectName("progressStatus")
+        status.addWidget(self.status_label, 1)
+        self.pct_label = QLabel("0%")
+        self.pct_label.setObjectName("progressPercent")
+        status.addWidget(self.pct_label)
+        layout.addLayout(status)
+        self._set_status("Đang chuẩn bị...")
+        layout.addStretch(1)
 
-        layout.addSpacing(5)
-
-        # Button layout
-        button_layout = QHBoxLayout()
-        button_layout.addStretch()
-
-        # OK button (hidden initially)
-        self.ok_btn = QPushButton("OK")
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        buttons.addStretch()
+        self.cancel_btn = QPushButton("Hủy")
+        # A stray Enter must not stop the OCR; a click or Space does.
+        self.cancel_btn.setAutoDefault(False)
+        self.cancel_btn.clicked.connect(self.cancel_operation)
+        buttons.addWidget(self.cancel_btn)
+        self.ok_btn = QPushButton("Đóng")
+        self.ok_btn.setProperty("variant", "primary")
         self.ok_btn.clicked.connect(self.accept)
         self.ok_btn.setVisible(False)
-        self.ok_btn.setStyleSheet("""
-            QPushButton {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #4CAF50, stop:1 #66BB6A);
-                color: white;
-                border: none;
-                border-radius: 6px;
-                padding: 8px 28px;
-                font-size: 10pt;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #43A047, stop:1 #5CB860);
-            }
-        """)
-        button_layout.addWidget(self.ok_btn)
+        buttons.addWidget(self.ok_btn)
+        layout.addLayout(buttons)
 
-        # Cancel button
-        self.cancel_btn = QPushButton("Hủy")
-        self.cancel_btn.setIcon(QIcon("icons/cancel.png"))
-        self.cancel_btn.clicked.connect(self.cancel_operation)
-        self.cancel_btn.setStyleSheet("""
-            QPushButton {
-                background-color: transparent;
-                color: #999999;
-                border: 1px solid #DDDDDD;
-                border-radius: 6px;
-                padding: 6px 20px;
-                font-size: 9pt;
-            }
-            QPushButton:hover {
-                background-color: #FFF0F0;
-                color: #FF5722;
-                border-color: #FF5722;
-            }
-        """)
-        button_layout.addWidget(self.cancel_btn)
-
-        button_layout.addStretch()
-        layout.addLayout(button_layout)
-
-        # Timer
         self.start_time = None
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._on_timer)
+
+    def _set_status(self, text):
+        """The current step, on one line; the whole of it in the tooltip."""
+        self.status_label.set_full_text(text)
+        self.status_label.setToolTip(text)
 
     def showEvent(self, event):
         """Start timer khi dialog hiển thị (hoạt động với cả show() và exec_())"""
@@ -2309,25 +2362,21 @@ class ProgressDialog(QDialog):
         """Handle cancel button click"""
         self.was_canceled = True
         self.task_label.setText("Đang hủy...")
-        self.spinner.stop()
+        self.spinner.stop(done=False)
         self.canceled.emit()
         self.reject()
 
     def _on_timer(self):
-        """Cập nhật message chờ - không hiện countdown, chỉ thông báo đang xử lý"""
+        """A calmer line under the title as the wait gets longer (no countdown)."""
         if self.start_time is None or self.is_completed:
             return
-        # Giữ message chờ tĩnh, thân thiện
         elapsed = int(time.time() - self.start_time)
-        if elapsed < 10:
-            self.time_label.setText("Tài liệu đang được xử lý, đồng chí vui lòng chờ giây lát.")
-        elif elapsed < 30:
-            self.time_label.setText("Đang phân tích nội dung văn bản, vui lòng chờ thêm...")
-        elif elapsed < 60:
-            self.time_label.setText("Văn bản phức tạp cần thêm thời gian, cảm ơn đồng chí đã kiên nhẫn.")
-        else:
-            mins = elapsed // 60
-            self.time_label.setText(f"Đã xử lý được {mins} phút, hệ thống đang nỗ lực hoàn thành...")
+        for limit, message in self.WAIT_MESSAGES:
+            if elapsed < limit:
+                self.time_label.setText(message)
+                return
+        self.time_label.setText(
+            f"Đã xử lý được {elapsed // 60} phút, hệ thống đang nỗ lực hoàn thành...")
 
     def update_progress(self, current: int, total: int = None, message: str = None):
         if self.is_completed:
@@ -2337,73 +2386,50 @@ class ProgressDialog(QDialog):
         target_pct = min(100.0, (current / self.total) * 100) if self.total > 0 else 0
 
         # Smooth animation: gradually fill toward target instead of jumping
-        current_pct = self.progress_bar.value()
-        if target_pct > current_pct:
+        if target_pct > self.progress_bar.value():
             self._smooth_target = target_pct
-            if not hasattr(self, '_smooth_timer') or self._smooth_timer is None:
+            if self._smooth_timer is None:
                 self._smooth_timer = QTimer(self)
                 self._smooth_timer.timeout.connect(self._animate_progress)
                 self._smooth_timer.start(50)  # 50ms ticks = 20fps smooth
 
-        if message:
-            self.status_label.setText(f"{message} ({target_pct:.0f}%)")
-        else:
-            self.status_label.setText(f"Đang xử lý... {target_pct:.0f}%")
+        self._set_status(message or "Đang xử lý...")
+        self.pct_label.setText(f"{target_pct:.0f}%")
 
     def _animate_progress(self):
         """Smoothly animate progress bar toward target."""
         if self.is_completed:
-            if hasattr(self, '_smooth_timer') and self._smooth_timer:
+            if self._smooth_timer is not None:
                 self._smooth_timer.stop()
             return
         current = self.progress_bar.value()
-        target = getattr(self, '_smooth_target', current)
+        target = self._smooth_target
         if current < target:
             # Ease-out: move faster when far from target, slower when close
             step = max(1, int((target - current) * 0.15))
             self.progress_bar.setValue(min(current + step, int(target)))
-        elif current >= target:
-            # At target — keep ticking slowly to simulate "working" feel
-            # Don't exceed the target though
-            pass
 
     def mark_completed(self):
-        """Đánh dấu hoàn thành với animation"""
+        """Done: the check, the time it took, and Đóng."""
         if self.is_completed:
             return
         self.is_completed = True
         self.timer.stop()
+        if self._smooth_timer is not None:
+            self._smooth_timer.stop()
         self.progress_bar.setValue(100)
+        self.pct_label.setText("100%")
         self.spinner.stop()
 
-        # Tính thời gian xử lý
         elapsed = time.time() - self.start_time if self.start_time else 0
-        elapsed_str = f"{elapsed:.1f}"
-
-        self.task_label.setText("Hoàn thành!")
-        self.task_label.setStyleSheet("font-size: 14pt; font-weight: bold; color: #4CAF50;")
-        self.status_label.setText(
-            f"Văn bản đã được xử lý trong {elapsed_str} giây,\n"
-            f"cảm ơn đồng chí đã kiên nhẫn chờ đợi."
-        )
-        self.status_label.setStyleSheet("font-size: 10pt; color: #333333;")
-        self.time_label.setText("")
+        seconds = f"{elapsed:.1f}".replace(".", ",")
+        self.task_label.setText("Hoàn thành")
+        self.time_label.setText(f"Văn bản đã được xử lý trong {seconds} giây.")
+        self._set_status("")
         self.cancel_btn.setVisible(False)
         self.ok_btn.setVisible(True)
-
-        # Progress bar chuyển xanh
-        self.progress_bar.setStyleSheet("""
-            QProgressBar {
-                background-color: #E8E8E8;
-                border: none;
-                border-radius: 3px;
-            }
-            QProgressBar::chunk {
-                border-radius: 3px;
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 #4CAF50, stop:1 #66BB6A);
-            }
-        """)
+        self.ok_btn.setDefault(True)
+        self.ok_btn.setFocus()
 
     def closeEvent(self, event):
         """Handle dialog close"""
@@ -2411,18 +2437,26 @@ class ProgressDialog(QDialog):
         self.spinner._timer.stop()
         super().closeEvent(event)
 
+
 class PreviewDialog(QDialog):
-    """Dialog for previewing PDF before processing"""
-    
+    """A look at a file before it is analysed.
+
+    One strip above the page, like the workspace tab bar: the file name and
+    size at the left, the viewer's page navigation at the right. At the foot
+    Hủy and the one primary action. A file that cannot be read shows the
+    viewer's error state, the same as in the workspace, without navigation.
+    """
+
     def __init__(self, pdf_path: str, parent=None):
         super().__init__(parent)
         self.pdf_path = pdf_path
         self.setup_ui()
-        
+
     def setup_ui(self):
+        self.setObjectName("previewDialog")
         self.setWindowTitle("Xem trước tệp")
         self.setWindowModality(Qt.ApplicationModal)
-        
+
         # Lấy kích thước màn hình hoặc cửa sổ cha để tạo dialog lớn hơn
         if self.parent():
             parent_size = self.parent().size()
@@ -2434,139 +2468,154 @@ class PreviewDialog(QDialog):
             screen = QApplication.primaryScreen().geometry()
             new_height = int(screen.height() * 0.85)
             new_width = int(new_height * 0.75)
-        
+
         self.resize(max(800, new_width), max(600, new_height))
         self.setMinimumSize(800, 600)
-        
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 10)
-        
-        # File info
-        info_layout = QHBoxLayout()
-        
-        file_info = os.path.basename(self.pdf_path)
-        if os.path.exists(self.pdf_path):
-            size_mb = os.path.getsize(self.pdf_path) / (1024 * 1024)
-            file_info += f" ({size_mb:.1f} MB)"
-            
-        info_label = QLabel(f"File: {file_info}")
-        info_label.setStyleSheet("font-weight: bold; padding: 5px;")
-        info_layout.addWidget(info_label)
-        info_layout.addStretch()
-        
-        # PDF viewer
-        self.viewer = PDFViewer()
-        if not self.viewer.load_pdf(self.pdf_path):
-            # Error loading PDF - show message
-            error_widget = QWidget()
-            error_layout = QVBoxLayout(error_widget)
-            error_icon = QLabel()
-            error_icon.setPixmap(icon("circle-alert", size=48, color="#B3263E").pixmap(64, 64))
-            error_icon.setAlignment(Qt.AlignCenter)
-            error_message = QLabel(f"Lỗi khi tải tệp:\n{self.pdf_path}")
-            error_message.setAlignment(Qt.AlignCenter)
-            error_message.setStyleSheet("color: red; font-weight: bold;")
-            error_layout.addStretch()
-            error_layout.addWidget(error_icon)
-            error_layout.addWidget(error_message)
-            error_layout.addStretch()
-            layout.addWidget(error_widget)
-        else:
-            layout.addLayout(info_layout)
-            layout.addWidget(self.viewer)
 
-        # Buttons
-        buttons = QHBoxLayout()
-        self.process_btn = QPushButton("Bắt đầu phân tích")
-        self.process_btn.setIcon(QIcon("icons/process.png"))
-        self.process_btn.clicked.connect(self.accept)
-        self.process_btn.setEnabled(os.path.exists(self.pdf_path))
-        
-        cancel_btn = QPushButton("Hủy")
-        cancel_btn.setIcon(QIcon("icons/cancel.png"))
-        cancel_btn.clicked.connect(self.reject)
-        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        exists = os.path.exists(self.pdf_path)
+        header = QFrame()
+        header.setObjectName("previewHeader")
+        header.setMinimumHeight(38)  # the same with or without navigation
+        row = QHBoxLayout(header)
+        row.setContentsMargins(16, 4, 4, 4)
+        row.setSpacing(8)
+        name = ElidedLabel(os.path.basename(self.pdf_path))
+        name.setObjectName("previewFileName")
+        name.setToolTip(self.pdf_path)
+        row.addWidget(name)
+        if exists:
+            size_mb = os.path.getsize(self.pdf_path) / (1024 * 1024)
+            size = QLabel(f"{size_mb:.1f} MB".replace(".", ","))
+            size.setObjectName("previewFileSize")
+            row.addWidget(size)
+        row.addStretch(1)
+        layout.addWidget(header)
+
+        # The viewer shows the page, or its own error state; its navigation
+        # strip moves into the header row.
+        self.viewer = PDFViewer()
+        loaded = self.viewer.load_pdf(self.pdf_path)
+        row.addWidget(self.viewer.take_nav_bar())
+        self.viewer.set_nav_allowed(bool(loaded))
+        layout.addWidget(self.viewer, 1)
+
+        footer = QFrame()
+        footer.setObjectName("previewFooter")
+        buttons = QHBoxLayout(footer)
+        buttons.setContentsMargins(16, 10, 16, 10)
+        buttons.setSpacing(8)
         buttons.addStretch()
-        buttons.addWidget(self.process_btn)
+        cancel_btn = QPushButton("Hủy")
+        cancel_btn.clicked.connect(self.reject)
         buttons.addWidget(cancel_btn)
-        
-        layout.addLayout(buttons)
+        self.process_btn = QPushButton("Bắt đầu phân tích")
+        self.process_btn.setProperty("variant", "primary")
+        self.process_btn.setToolTip("Nhận dạng văn bản và trích các trường thông tin")
+        self.process_btn.clicked.connect(self.accept)
+        self.process_btn.setEnabled(exists)
+        self.process_btn.setDefault(exists)
+        buttons.addWidget(self.process_btn)
+        layout.addWidget(footer)
+        # The page has the keyboard first (not the page-number field).
+        self.viewer.setFocus()
+
 
 #############################
-#  Model Selection Dialog   #
+#  Keyword Search Dialog    #
 #############################
 class SearchDialog(QDialog):
-    """Dialog tìm kiếm từ khóa nâng cao với bảng kết quả"""
+    """Keyword search over the full text of the library.
+
+    One field (how to write the keywords is its tooltip, not a line on
+    screen), the primary Tìm kiếm button, the matches with how often the
+    keywords occur, and a short count underneath. A match opens with its
+    row button or a double click.
+    """
     document_selected = pyqtSignal(int, list)  # doc_id, keywords
+
+    # The id column stays for the code (UserRole) and is hidden.
+    COLUMNS = ("ID", "Văn bản", "Số lần", "")
 
     def __init__(self, db, parent=None):
         super().__init__(parent)
         self.db = db
+        self.setObjectName("searchDialog")
         self.setWindowTitle("Tìm kiếm văn bản")
-        self.setWindowIcon(QIcon("icons/find.png"))
-        self.resize(800, 500)
+        self.resize(720, 480)
         self.setup_ui()
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setSpacing(10)
+        layout.setContentsMargins(16, 16, 16, 12)
+        layout.setSpacing(12)
 
-        # Hướng dẫn
-        hint = QLabel("Nhập từ khóa cần tìm, cách nhau bởi dấu phẩy (,)")
-        hint.setStyleSheet("color: #666; font-style: italic;")
-        layout.addWidget(hint)
-
-        # Input row
         input_layout = QHBoxLayout()
+        input_layout.setSpacing(8)
         self.search_input = QLineEdit()
+        self.search_input.setObjectName("searchField")
         self.search_input.setPlaceholderText("Ví dụ: quyết định, bổ nhiệm, nhân sự")
-        self.search_input.setMinimumHeight(32)
+        self.search_input.setToolTip(chrome_tooltip(
+            "Từ khóa cần tìm, cách nhau bởi dấu phẩy", "Enter"))
+        tokens = theme_tokens.colors_for(AppThemeManager.instance().current)
+        self.search_input.addAction(
+            icon("search", size=16, color=tokens["text_muted"]), QLineEdit.LeadingPosition)
         self.search_input.returnPressed.connect(self.do_search)
+        input_layout.addWidget(self.search_input, 1)
 
         self.search_btn = QPushButton("Tìm kiếm")
-        self.search_btn.setIcon(QIcon("icons/find.png"))
-        self.search_btn.setMinimumHeight(32)
+        self.search_btn.setProperty("variant", "primary")
         self.search_btn.clicked.connect(self.do_search)
-
-        input_layout.addWidget(self.search_input)
         input_layout.addWidget(self.search_btn)
         layout.addLayout(input_layout)
 
-        # Bảng kết quả
-        self.result_table = QTableWidget()
-        self.result_table.setColumnCount(4)
-        self.result_table.setHorizontalHeaderLabels(["ID", "Tên văn bản", "Tần suất", "Xem PDF"])
-        self.result_table.horizontalHeader().setFixedHeight(28)
-        self.result_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.result_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.result_table.verticalHeader().setVisible(False)
-        self.result_table.setSortingEnabled(True)
+        table = QTableWidget()
+        table.setObjectName("searchResults")
+        table.setColumnCount(len(self.COLUMNS))
+        table.setHorizontalHeaderLabels(self.COLUMNS)
+        table.horizontalHeaderItem(2).setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        table.setColumnHidden(0, True)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setSelectionMode(QTableWidget.SingleSelection)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setShowGrid(False)
+        table.setWordWrap(False)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(30)
+        table.setSortingEnabled(True)
+        header = table.horizontalHeader()
+        header.setHighlightSections(False)
+        header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        header.setSectionResizeMode(0, QHeaderView.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.Fixed)
+        header.setSectionResizeMode(3, QHeaderView.Fixed)
+        table.setColumnWidth(2, 72)
+        table.setColumnWidth(3, 40)
+        table.cellDoubleClicked.connect(self._open_row)
+        self.result_table = table
+        layout.addWidget(table, 1)
 
-        # Cỡ cột
-        header = self.result_table.horizontalHeader()
-        header.setSectionResizeMode(0, header.Fixed)
-        header.setSectionResizeMode(1, header.Stretch)
-        header.setSectionResizeMode(2, header.Fixed)
-        header.setSectionResizeMode(3, header.Fixed)
-        self.result_table.setColumnWidth(0, 50)
-        self.result_table.setColumnWidth(2, 80)
-        self.result_table.setColumnWidth(3, 90)
-
-        layout.addWidget(self.result_table)
-
-        # Status bar
         self.status_label = QLabel("")
-        self.status_label.setStyleSheet("color: #333;")
+        self.status_label.setObjectName("searchStatus")
         layout.addWidget(self.status_label)
 
-        # Focus vào input
         self.search_input.setFocus()
+
+    def _show_status(self, text, danger=False):
+        self.status_label.setText(text)
+        self.status_label.setProperty("tone", "danger" if danger else "")
+        self.status_label.style().unpolish(self.status_label)
+        self.status_label.style().polish(self.status_label)
 
     def do_search(self):
         """Thực hiện tìm kiếm"""
         query_text = self.search_input.text().strip()
         if not query_text:
-            self.status_label.setText("Vui lòng nhập từ khóa.")
+            self._show_status("Nhập từ khóa để tìm.")
             return
 
         # Đổi separator từ , sang ; cho tương thích với db.search_documents
@@ -2575,81 +2624,205 @@ class SearchDialog(QDialog):
 
         try:
             results = self.db.search_documents(db_query, "all")
+            tokens = theme_tokens.colors_for(AppThemeManager.instance().current)
 
             self.result_table.setSortingEnabled(False)
             self.result_table.setRowCount(len(results))
-
             for row, (doc, stats) in enumerate(results):
-                # ID
-                id_item = QTableWidgetItem(str(doc[0]))
-                id_item.setData(Qt.UserRole, doc[0])
-                id_item.setTextAlignment(Qt.AlignCenter)
-                self.result_table.setItem(row, 0, id_item)
-
-                # Tên văn bản
-                name_item = QTableWidgetItem(doc[2])
-                # Tooltip with snippets
-                tooltip_parts = [f"Đường dẫn: {doc[1]}"]
-                if stats['snippets']:
-                    tooltip_parts.append("\n--- Đoạn văn bản tìm thấy ---")
-                    for snippet in stats['snippets'][:5]:
-                        tooltip_parts.append(f"• Dòng {snippet['line']}: {snippet['context']}")
-                name_item.setToolTip('\n'.join(tooltip_parts))
-                self.result_table.setItem(row, 1, name_item)
-
-                # Tần suất
-                freq = stats['total_frequency']
-                freq_item = QTableWidgetItem()
-                freq_item.setData(Qt.DisplayRole, freq)
-                freq_item.setTextAlignment(Qt.AlignCenter)
-                # Color code
-                if freq > 10:
-                    freq_item.setBackground(QColor(144, 238, 144))
-                elif freq > 5:
-                    freq_item.setBackground(QColor(255, 255, 200))
-                elif freq > 0:
-                    freq_item.setBackground(QColor(230, 230, 250))
-                # Tooltip breakdown
-                if stats['keyword_frequencies']:
-                    kw_breakdown = [f"{kw}: {count}" for kw, count in stats['keyword_frequencies'].items()]
-                    freq_item.setToolTip("Số lần xuất hiện:\n" + '\n'.join(kw_breakdown))
-                self.result_table.setItem(row, 2, freq_item)
-
-                # Nút Xem PDF
-                preview_btn = QPushButton("Xem PDF")
-                preview_btn.setStyleSheet("""
-                    QPushButton {
-                        background-color: #2196F3;
-                        color: white;
-                        border: none;
-                        border-radius: 3px;
-                        padding: 4px 8px;
-                    }
-                    QPushButton:hover {
-                        background-color: #1976D2;
-                    }
-                """)
-                doc_id = doc[0]
-                preview_btn.clicked.connect(lambda checked, did=doc_id: self.preview_document(did))
-                self.result_table.setCellWidget(row, 3, preview_btn)
-
+                self._fill_row(row, doc, stats, tokens)
             self.result_table.setSortingEnabled(True)
             # Sắp xếp theo tần suất giảm dần
             self.result_table.sortItems(2, Qt.DescendingOrder)
 
-            self.status_label.setText(
-                f"Tìm thấy {len(results)} tài liệu với từ khóa: {', '.join(keywords)}"
-            )
-
+            found = (f"Tìm thấy {len(results)} văn bản" if results
+                     else "Không tìm thấy văn bản nào")
+            self._show_status(f"{found} với từ khóa: {', '.join(keywords)}")
         except Exception as e:
             logger.error(f"Search error: {str(e)}")
-            self.status_label.setText(f"Lỗi tìm kiếm: {str(e)}")
+            self._show_status(f"Lỗi tìm kiếm: {str(e)}", danger=True)
+
+    def _fill_row(self, row, doc, stats, tokens):
+        doc_id = doc[0]
+        id_item = QTableWidgetItem(str(doc_id))
+        id_item.setData(Qt.UserRole, doc_id)
+        self.result_table.setItem(row, 0, id_item)
+
+        # The document number when the OCR found one, like the library; the
+        # file name otherwise, in the quieter tone.
+        symbol = doc[8] if len(doc) > 8 and doc[8] else ""
+        name_item = QTableWidgetItem(symbol or doc[2])
+        if not symbol:
+            name_item.setForeground(QColor(tokens["text_secondary"]))
+        tooltip_parts = [doc[2], doc[1]]
+        if stats['snippets']:
+            tooltip_parts.append("")
+            for snippet in stats['snippets'][:5]:
+                tooltip_parts.append(f"Dòng {snippet['line']}: {snippet['context']}")
+        name_item.setToolTip('\n'.join(tooltip_parts))
+        self.result_table.setItem(row, 1, name_item)
+
+        freq_item = QTableWidgetItem()
+        freq_item.setData(Qt.DisplayRole, stats['total_frequency'])
+        freq_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        if stats['keyword_frequencies']:
+            breakdown = [f"{kw}: {count}" for kw, count in stats['keyword_frequencies'].items()]
+            freq_item.setToolTip("Số lần xuất hiện\n" + '\n'.join(breakdown))
+        self.result_table.setItem(row, 2, freq_item)
+
+        open_btn = QToolButton()
+        open_btn.setObjectName("searchOpenButton")
+        open_btn.setAutoRaise(True)
+        open_btn.setIcon(chrome_icon("open", 16))
+        open_btn.setToolTip("Mở văn bản này")
+        open_btn.setAccessibleName("Mở văn bản này")
+        open_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        open_btn.clicked.connect(lambda checked, did=doc_id: self.preview_document(did))
+        cell = QWidget()
+        centred = QHBoxLayout(cell)
+        centred.setContentsMargins(0, 0, 0, 0)
+        centred.addWidget(open_btn, 0, Qt.AlignCenter)
+        self.result_table.setCellWidget(row, 3, cell)
+
+    def _open_row(self, row, _column):
+        item = self.result_table.item(row, 0)
+        if item is not None:
+            self.preview_document(item.data(Qt.UserRole))
 
     def preview_document(self, doc_id):
         """Mở document và đóng dialog, truyền kèm keywords"""
         keywords = [kw.strip() for kw in self.search_input.text().split(',') if kw.strip()]
         self.document_selected.emit(doc_id, keywords)
         self.accept()
+
+
+#############################
+#       About Dialog        #
+#############################
+class AboutDialog(QDialog):
+    """About OCR VBHC, in the words of the home page's about sheet
+    (frontend/landing/index.html, <dialog class="about">): the name and
+    version beside the app mark, one paragraph on what it does, a few facts,
+    the licences of the bundled font and icons, and the note on the
+    assistant.
+
+    The mark is the app icon (assets/app_icon_256.png), as on the home
+    page's about sheet and its top bar.
+    """
+
+    WIDTH = 540
+    SUMMARY = ("Số hóa văn bản hành chính trên máy: nhận dạng PDF và ảnh, trích các "
+               "trường thông tin theo Nghị định 30, lập chỉ mục và hỏi đáp có trích dẫn.")
+    FACTS = (
+        ("Người phát triển", "Trần Hậu Mạnh"),
+        ("Quyền riêng tư", "Tệp, chỉ mục và hội thoại ở lại trên máy; không gửi lên "
+                           "dịch vụ đám mây."),
+        ("Trí tuệ nhân tạo", "Chandra nhận dạng văn bản; Qwen3 4B/8B trả lời và điều phối "
+                             "công cụ cho trợ lý pháp luật."),
+        ("Kho tri thức", "Tìm kiếm toàn văn FTS5 tiếng Việt, sqlite-vec, xếp hạng lại "
+                         "ngữ nghĩa và đồ thị quan hệ pháp lý."),
+    )
+    # From THIRD_PARTY_NOTICES.md, shipped beside the app.
+    LICENCES = ("Giấy phép",
+                "Phông Be Vietnam Pro (SIL OFL 1.1), biểu tượng Fluent UI của Microsoft "
+                "(MIT). Chi tiết trong THIRD_PARTY_NOTICES.md.")
+    NOTE = ("Câu trả lời của trợ lý chỉ hỗ trợ tra cứu, không thay thế ý kiến chuyên môn "
+            "hoặc tư vấn pháp lý.")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("aboutDialog")
+        self.setWindowTitle("Về ứng dụng")
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 20)
+        layout.setSpacing(0)
+
+        heading = QHBoxLayout()
+        heading.setSpacing(12)
+        self._mark = QLabel()
+        self._mark.setObjectName("aboutMark")
+        self._mark.setFixedSize(36, 36)
+        heading.addWidget(self._mark, 0, Qt.AlignVCenter)
+        names = QVBoxLayout()
+        names.setSpacing(0)
+        self._title = QLabel("OCR VBHC")
+        self._title.setObjectName("aboutTitle")
+        names.addWidget(self._title)
+        version = QLabel(f"Phiên bản {APP_VERSION}")
+        version.setObjectName("aboutVersion")
+        names.addWidget(version)
+        heading.addLayout(names, 1)
+        layout.addLayout(heading)
+        layout.addSpacing(16)
+
+        summary = self._paragraph(self.SUMMARY)
+        summary.setObjectName("aboutSummary")
+        layout.addWidget(summary)
+        layout.addSpacing(16)
+
+        facts = QFrame()
+        facts.setObjectName("aboutFacts")
+        rows = QVBoxLayout(facts)
+        rows.setContentsMargins(0, 0, 0, 0)
+        rows.setSpacing(0)
+        for term_text, value_text in self.FACTS + (self.LICENCES,):
+            row = QFrame()
+            row.setProperty("role", "aboutFact")
+            line = QHBoxLayout(row)
+            line.setContentsMargins(0, 8, 0, 8)
+            line.setSpacing(16)
+            term = QLabel(term_text)
+            term.setProperty("role", "aboutTerm")
+            term.setFixedWidth(120)
+            term.setWordWrap(True)
+            line.addWidget(term, 0, Qt.AlignTop)
+            value = self._paragraph(value_text)
+            value.setProperty("role", "aboutValue")
+            line.addWidget(value, 1)
+            rows.addWidget(row)
+        layout.addWidget(facts)
+        layout.addSpacing(16)
+
+        note = QLabel(self.NOTE)
+        note.setObjectName("aboutNote")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        layout.addSpacing(16)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        close_btn = QPushButton("Đóng")
+        close_btn.setDefault(True)
+        close_btn.clicked.connect(self.accept)
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+
+        self.apply_theme()
+        AppThemeManager.instance().theme_changed.connect(self.apply_theme)
+        self.ensurePolished()
+        self.setFixedSize(self.WIDTH, layout.totalHeightForWidth(self.WIDTH))
+
+    @staticmethod
+    def _paragraph(text):
+        """A wrapped, selectable paragraph with the home page's looser
+        leading (QSS has no line-height; Qt rich text does)."""
+        label = QLabel("<p style='line-height:130%; margin:0'>{}</p>".format(html.escape(text)))
+        label.setTextFormat(Qt.RichText)
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        return label
+
+    def apply_theme(self, theme=None):
+        """The app icon, as on the home page's about sheet, and the name in
+        the olive of the theme."""
+        colour = _mark_colour(theme)
+        mark = QPixmap(str(Path(__file__).parent / "assets" / "app_icon_256.png"))
+        ratio = self.devicePixelRatioF() or 1.0
+        mark = mark.scaled(int(36 * ratio), int(36 * ratio), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        mark.setDevicePixelRatio(ratio)
+        self._mark.setPixmap(mark)
+        self._title.setStyleSheet(f"color: {colour};")
 
 
 class MainWindow(QMainWindow):
@@ -2659,6 +2832,9 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Hệ thống OCR Văn Bản")
+        # Before any widget exists: scrolling over Độ khẩn / Độ mật (and every
+        # other combo or spin box) must scroll, not change the value.
+        install_wheel_guard(QApplication.instance())
 
         self.setWindowIcon(QApplication.instance().windowIcon())
 
@@ -2719,6 +2895,7 @@ class MainWindow(QMainWindow):
         self.current_search_keywords = []  # Store active search keywords for highlighting
         self._details_user_choice = None
         self._layout_bucket = None
+        self._chat_open = False
         
         # Thông tin người dùng đăng nhập
         self.current_user = {
@@ -2766,7 +2943,6 @@ class MainWindow(QMainWindow):
         self.setup_ui()
         self.addDockWidget(Qt.RightDockWidgetArea, self.chat_panel)
         self.chat_panel.open_document_requested.connect(self._open_chat_document)
-        self.chat_panel.visibilityChanged.connect(self.act_chat.setChecked)
         self.chat_panel.visibilityChanged.connect(self._on_chat_visibility_changed)
         self.chat_panel.hide()
         self.menuBar().setVisible(False)  # suppress legacy Qt menu strip
@@ -2837,7 +3013,7 @@ class MainWindow(QMainWindow):
             return
             
         # Create progress dialog
-        progress = ProgressDialog(len(missing_files), "Repairing File Paths", self)
+        progress = ProgressDialog(len(missing_files), "Đang sửa đường dẫn tệp", self)
         
         # Create worker thread
         self.repair_worker = FileRepairWorker(self.db, missing_files)
@@ -2898,7 +3074,7 @@ class MainWindow(QMainWindow):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QVBoxLayout(main_widget)
-        main_layout.setContentsMargins(2, 0, 2, 2)  # Minimal margins
+        main_layout.setContentsMargins(0, 0, 0, 0)  # panels meet the window edge
         main_layout.setSpacing(0)  # No spacing between major sections
 
         # 1. Setup native QToolBar (Phase 10, 2026-04-18).
@@ -2914,6 +3090,7 @@ class MainWindow(QMainWindow):
         content_layout.setSpacing(0)
 
         splitter = QSplitter(Qt.Horizontal)
+        splitter.setObjectName("workspace_splitter")  # drawn as a hairline
         splitter.setHandleWidth(6)  # Easier to grab than 1px
         # Allow dragging + collapsing left/right panels (keep center pinned).
         # 2026-04-18 fix: setChildrenCollapsible(False) + thin 1px handle +
@@ -2923,26 +3100,18 @@ class MainWindow(QMainWindow):
         splitter.setOpaqueResize(False)
         self._main_splitter = splitter  # keep ref for later config
 
-        # LEFT PANEL - Document List and Versions
+        # LEFT PANEL — Kho văn bản (2026-10 minimal redesign).
+        # A title with the count, one filter field with a sort menu beside
+        # it, then the list. Rows show the document number (or the file name
+        # while there is none) and the issue date; everything else — status,
+        # summary, pages — is in the row tooltip, so nothing is cut or printed
+        # as a legend.
         left_panel = QWidget()
+        left_panel.setObjectName("library_panel")
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(1)
+        left_layout.setSpacing(0)
 
-        # Document Tabs
-        self.doc_tabs = QTabWidget()
-        self.doc_tabs.setDocumentMode(True)
-        self.doc_tabs.setStyleSheet("""
-            QTabBar::tab {
-                height: 24px;
-                padding: 2px 8px;
-            }
-        """)
-
-        # Document List — minimalist redesign 2026-04-18.
-        # Replaced 8-column QTableWidget with clean 2-field list (STT + filename).
-        # Rich metadata (số hiệu, ND chính, pages, urgency, size) shows on hover
-        # popover. Sorting/filtering moved to search dialog + status dot.
         self.doc_list = DocumentListWidget()
         self.doc_list.doc_clicked.connect(self.document_selected_by_id)
         self.doc_list.context_menu_requested.connect(self.show_document_context_menu_by_id)
@@ -2956,116 +3125,134 @@ class MainWindow(QMainWindow):
         # gallery_item_selected, show_gallery_context_menu) purged.
         # No-op stub to prevent AttributeError in any lingering callers.
         self.doc_gallery = None
-
-        # ── Unified toolbar above the list ──────────────────────
-        # Single-row toolbar (36px) that aligns with the overall header
-        # density: filter input on the left, sort dropdown on the right.
-        # Below it a tiny legend strip (16px) explains status icons.
-        self._doc_list_panel = QWidget()
-        _dlp_layout = QVBoxLayout(self._doc_list_panel)
-        _dlp_layout.setContentsMargins(8, 8, 8, 8)
-        _dlp_layout.setSpacing(6)
+        self._doc_list_panel = left_panel
 
         library_header = QHBoxLayout()
+        library_header.setContentsMargins(12, 10, 10, 6)
+        library_header.setSpacing(6)
         library_title = QLabel("Kho văn bản")
-        library_title.setProperty("role", "sectionTitle")
+        library_title.setObjectName("library_title")
         library_header.addWidget(library_title)
         library_header.addStretch()
-        self._library_count_label = QLabel("0 văn bản")
-        self._library_count_label.setProperty("role", "muted")
+        self._library_count_label = QLabel("0")
+        self._library_count_label.setObjectName("library_count")
         library_header.addWidget(self._library_count_label)
-        _dlp_layout.addLayout(library_header)
+        left_layout.addLayout(library_header)
 
-        toolbar = QFrame()
-        toolbar.setObjectName("doc_toolbar")
-        toolbar.setFixedHeight(36)
-        tb_layout = QHBoxLayout(toolbar)
-        tb_layout.setContentsMargins(6, 3, 6, 3)
-        tb_layout.setSpacing(6)
+        filter_row = QHBoxLayout()
+        filter_row.setContentsMargins(8, 0, 8, 6)
+        filter_row.setSpacing(4)
 
-        # Inline filter — live-filters the list by filename/số hiệu.
+        # Live filter over the number and the file name.
         self._doc_filter_input = QLineEdit()
-        self._doc_filter_input.setPlaceholderText("Tìm trong kho…")
-        self._doc_filter_input.setClearButtonEnabled(True)
-        self._doc_filter_input.setFixedHeight(28)
+        self._doc_filter_input.setObjectName("library_filter")
+        self._doc_filter_input.setPlaceholderText("Lọc theo số hiệu, tên tệp")
+        self._doc_filter_input.setFixedHeight(26)
+        self._doc_filter_input.setToolTip(chrome_tooltip(
+            "Lọc kho văn bản",
+            hint="Gõ một phần số hiệu hoặc tên tệp; tìm theo nội dung: Ctrl+F"))
+        self._doc_filter_lead = self._doc_filter_input.addAction(
+            QIcon(), QLineEdit.LeadingPosition)
+        self._doc_filter_clear = self._doc_filter_input.addAction(
+            QIcon(), QLineEdit.TrailingPosition)
+        self._doc_filter_clear.setToolTip("Xóa bộ lọc")
+        self._doc_filter_clear.setVisible(False)
+        self._remember_icon(self._doc_filter_lead, "search", 16)
+        self._remember_icon(self._doc_filter_clear, "x", 16)
+        self._doc_filter_clear.triggered.connect(self._doc_filter_input.clear)
+        self._doc_filter_input.textChanged.connect(
+            lambda text: self._doc_filter_clear.setVisible(bool(text)))
         self._doc_filter_input.textChanged.connect(self._on_doc_filter_changed)
-        tb_layout.addWidget(self._doc_filter_input, 1)
+        filter_row.addWidget(self._doc_filter_input, 1)
 
-        self._doc_sort_combo = QComboBox()
-        self._doc_sort_combo.addItem("Mới nhất", "date_desc")
-        self._doc_sort_combo.addItem("Cũ nhất", "date_asc")
-        self._doc_sort_combo.addItem("Tên A→Z", "name_asc")
-        self._doc_sort_combo.addItem("Tên Z→A", "name_desc")
-        self._doc_sort_combo.addItem("ID ↓", "id_desc")
-        self._doc_sort_combo.addItem("ID ↑", "id_asc")
-        self._doc_sort_combo.setFixedHeight(28)
-        self._doc_sort_combo.setFixedWidth(92)
-        self._doc_sort_combo.currentIndexChanged.connect(self._on_doc_sort_changed)
-        tb_layout.addWidget(self._doc_sort_combo)
+        # Sort: a small icon button whose menu holds the choices.
+        from PyQt5.QtWidgets import QActionGroup
+        self._doc_sort_key = "date_desc"
+        self._doc_sort_btn = QToolButton()
+        self._doc_sort_btn.setObjectName("library_sort")
+        self._doc_sort_btn.setAutoRaise(True)
+        self._doc_sort_btn.setPopupMode(QToolButton.InstantPopup)
+        sort_menu = QMenu(self._doc_sort_btn)
+        sort_group = QActionGroup(sort_menu)
+        sort_group.setExclusive(True)
+        self._doc_sort_actions = {}
+        for key, label in self.DOC_SORTS:
+            if key is None:
+                sort_menu.addSeparator()
+                continue
+            action = sort_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(key == self._doc_sort_key)
+            action.setData(key)
+            sort_group.addAction(action)
+            self._doc_sort_actions[key] = action
+        sort_group.triggered.connect(
+            lambda action: self._on_doc_sort_changed(action.data()))
+        self._doc_sort_btn.setMenu(sort_menu)
+        self._doc_sort_btn.setIconSize(QSize(16, 16))
+        self._remember_icon(self._doc_sort_btn, "sort", 16)
+        filter_row.addWidget(self._doc_sort_btn)
+        self._update_doc_sort_tooltip()
+        left_layout.addLayout(filter_row)
 
-        # Tiny legend under toolbar — explains status glyphs without
-        # consuming primary toolbar space.
-        legend = QLabel("● đã OCR    ◐ chưa đủ    ○ chờ")
-        legend.setProperty("role", "muted")
-        legend.setAlignment(Qt.AlignLeft)
-
-        _dlp_layout.addWidget(toolbar)
-        _dlp_layout.addWidget(legend)
-        _dlp_layout.addWidget(self.doc_list, 1)
-
-        # Add panel to tabs. DocumentListWidget stays accessible via self.doc_list.
-        self.doc_tabs.addTab(self._doc_list_panel, "Danh sách")
-        self.doc_tabs.tabBar().hide()  # single-tab layout
-
-        # Version history panel removed 2026-04-18 — single-version pipeline
-        # (re-OCR overwrites in place, no multi-version workflow).
-        left_layout.addWidget(self.doc_tabs, 1)
-
+        left_layout.addWidget(self.doc_list, 1)
         splitter.addWidget(left_panel)
 
     # CENTER PANEL - PDF Viewer and Metadata
+        # A quiet underline tab strip; the page navigation sits at its right
+        # end (one 32px row instead of two) and only while the page is shown.
+        # Not documentMode: that draws a palette-coloured base line under the
+        # corner widget (white in the dark theme); the pane's top hairline is
+        # the only line here.
         center_panel = QTabWidget()
-        center_panel.setDocumentMode(True)
-        center_panel.setStyleSheet("""
-            QTabBar::tab {
-                height: 24px;
-                padding: 2px 8px;
-            }
-        """)
+        center_panel.setObjectName("workspace_tabs")
+        center_panel.setAttribute(Qt.WA_StyledBackground, True)  # the row is a surface
+        center_panel.tabBar().setDrawBase(False)
 
         # PDF Viewer Tab
         self.pdf_viewer = PDFViewer()
         self.pdf_viewer.addRequested.connect(self.add_file)
         self.pdf_viewer.pageChanged.connect(self.page_changed)
         center_panel.addTab(self.pdf_viewer, "Xem văn bản")
+        center_panel.setCornerWidget(self.pdf_viewer.take_nav_bar(), Qt.TopRightCorner)
+        center_panel.currentChanged.connect(
+            lambda index: self.pdf_viewer.set_nav_allowed(index == 0))
+        # Narrow: tab labels shorten instead of hiding behind scroll arrows.
+        center_panel.tabBar().setUsesScrollButtons(False)
+        center_panel.tabBar().setElideMode(Qt.ElideRight)
 
         # Metadata Tab
         metadata_scroll = QScrollArea()
         metadata_scroll.setWidgetResizable(True)
         metadata_scroll.setFrameShape(QFrame.NoFrame)
         
+        # A plain read-only sheet: muted labels, values as selectable text
+        # that wraps — no sunken boxes (they turned black in the dark theme).
         metadata_content = QWidget()
+        metadata_content.setObjectName("file_info")
         metadata_layout = QVBoxLayout(metadata_content)
         metadata_layout.setSpacing(8)
-        metadata_layout.setContentsMargins(8, 8, 8, 8)
+        metadata_layout.setContentsMargins(16, 14, 16, 16)
 
         # Create metadata form
         metadata_form = QWidget()
         form_layout = QFormLayout(metadata_form)
-        form_layout.setVerticalSpacing(6)
+        form_layout.setVerticalSpacing(8)
+        form_layout.setHorizontalSpacing(16)
+        form_layout.setLabelAlignment(Qt.AlignLeft | Qt.AlignTop)
         form_layout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
         # Initialize metadata fields
         self.metadata_fields = {}
         metadata_field_labels = [
-            ('id', 'ID'),
-            ('filename', 'Tên file'),
-            ('created', 'Ngày tạo'),
+            ('id', 'Mã'),
+            ('filename', 'Tên tệp'),
+            ('created', 'Ngày thêm'),
             ('modified', 'Sửa đổi'),
             ('pages', 'Số trang'),
             ('filesize', 'Kích thước'),
             ('versions', 'Phiên bản'),
-            ('cqbh', 'Cơ quan BH'),
+            ('cqbh', 'Cơ quan ban hành'),
             ('so_kh', 'Số ký hiệu'),
             ('loai_vb', 'Loại văn bản'),
             ('do_khan', 'Độ khẩn'),
@@ -3073,17 +3260,14 @@ class MainWindow(QMainWindow):
         ]
 
         for field_id, label in metadata_field_labels:
-            # Create label
-            field_label = QLabel(f"<b>{label}:</b>")
-            
-            # Create value field
+            field_label = QLabel(label)
+            field_label.setProperty("role", "fileInfoLabel")
+
             field = QLabel()
-            field.setFrameShape(QFrame.StyledPanel)
-            field.setFrameShadow(QFrame.Sunken)
-            field.setMinimumHeight(22)
+            field.setWordWrap(True)
             field.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            field.setProperty("role", "metadataValue")
-            
+            field.setProperty("role", "fileInfoValue")
+
             self.metadata_fields[field_id] = field
             form_layout.addRow(field_label, field)
 
@@ -3091,6 +3275,8 @@ class MainWindow(QMainWindow):
         metadata_layout.addStretch()
         metadata_scroll.setWidget(metadata_content)
         center_panel.addTab(metadata_scroll, "Thông tin tệp")
+        center_panel.setTabToolTip(0, "Trang văn bản gốc")
+        center_panel.setTabToolTip(1, "Tệp, kích thước và các trường đã nhận dạng")
 
         splitter.addWidget(center_panel)
 
@@ -3134,272 +3320,231 @@ class MainWindow(QMainWindow):
         self.current_search_keywords = []
 
 
+    # Library sort choices (key, menu label); (None, None) is a separator.
+    DOC_SORTS = (
+        ("date_desc", "Mới thêm gần đây"),
+        ("date_asc", "Thêm sớm nhất"),
+        (None, None),
+        ("issued_desc", "Ngày ban hành mới nhất"),
+        ("issued_asc", "Ngày ban hành cũ nhất"),
+        (None, None),
+        ("name_asc", "Số hiệu A–Z"),
+        ("name_desc", "Số hiệu Z–A"),
+    )
+
     def _build_main_toolbar(self) -> None:
-        """Unified top toolbar (Phase 12, 2026-04-19 redesign).
+        """The top toolbar (2026-10 minimal redesign).
 
-        Single source of navigation — replaces both the legacy QMenuBar and
-        the previous 12-icon toolbar. Uses split buttons to consolidate
-        semantically-paired actions (Thêm 1 file + Thêm nhiều → one dropdown)
-        and an overflow (⋯) menu for secondary actions.
+        One 34px row of 18px icon buttons in groups split by hairlines, no
+        text beside the icons. Grouped actions open a menu on click (Thêm,
+        Tìm, the overflow). Every button explains itself in a tooltip: what
+        it does, a line of context, then the shortcut. The middle names the
+        open document — its type, its number in gold, the page count — with
+        the file name in the tooltip.
 
-        Layout: Home/panels · Add · edit · search/chat · document context ·
-        analytics/export · theme/overflow.
+            mark | library details | add▾ delete | search▾ assistant
+                            Kế hoạch 336/KH-KTNS 4 trang
+                                analytics excel | theme more▾
 
-        Split buttons:
-          • "Thêm ▾" — main click = Ctrl+O, dropdown = batch / drag tip
-          • "Tìm ▾"  — main click = Ctrl+F, dropdown = AI semantic search
-
-        Overflow menu:
-          Xem trước PDF (Ctrl+P) · Refresh (F5) · Sao lưu DB · Kiểm tra
-          file · Cài đặt (Ctrl+,) · Hướng dẫn (F1) · Về ứng dụng
+        Save and reset act on the editor and live there; their shortcuts
+        (Ctrl+S, Ctrl+Shift+Backspace) stay on the window.
         """
-        from ui_icons import icon, make_tool_action, preload_icons
-
-        # Pre-warm cache for all toolbar icons — ~6ms one-time.
-        preload_icons([
-            "house", "panel-left", "file-plus", "folder-open", "save", "undo-2", "trash-2",
-            "search", "bar-chart-3", "archive", "moon", "more-horizontal",
-            "chevron-down", "command",
-        ], size=20)
-
+        self._chrome_icons = []  # (target, icon, size, role, on icon) for theme switches
         toolbar = self.addToolBar("Main")
         toolbar.setObjectName("main_toolbar")
         toolbar.setMovable(False)
         toolbar.setFloatable(False)
-        toolbar.setIconSize(QSize(20, 20))
+        toolbar.setIconSize(QSize(18, 18))
         toolbar.setToolButtonStyle(Qt.ToolButtonIconOnly)
         toolbar.setContextMenuPolicy(Qt.PreventContextMenu)
 
-        # ── Group 1: Home + view toggle ───────────────────
-        self.act_home = make_tool_action(
-            self, "house", "Bàn bắt đầu việc ({})".format(command("home").shortcut),
-            callback=lambda _checked=False: self.home_requested.emit(),
-            shortcut=command("home").shortcut,
+        def action(command_id, callback, icon_name, title, hint="", role="tool",
+                   checkable=False, on_name=None, size=18):
+            spec = command(command_id)
+            act = QAction(title, self)
+            if spec.shortcut:
+                act.setShortcut(QKeySequence(spec.shortcut))
+            act.setToolTip(chrome_tooltip(title, spec.shortcut, hint))
+            act.setCheckable(checkable)
+            (act.toggled if checkable else act.triggered).connect(callback)
+            self._remember_icon(act, icon_name, size, role, on_name)
+            self.addAction(act)  # the shortcut works whatever is on screen
+            return act
+
+        def menu_button(icon_name, title, shortcut, hint, menu):
+            button = QToolButton(toolbar)
+            button.setAutoRaise(True)
+            button.setIconSize(QSize(18, 18))
+            button.setPopupMode(QToolButton.InstantPopup)
+            button.setMenu(menu)
+            button.setToolTip(chrome_tooltip(title, shortcut, hint))
+            button.setAccessibleName(title)
+            self._remember_icon(button, icon_name, 18)
+            toolbar.addWidget(button)
+            return button
+
+        # ── The mark, which is also the way home ──────────
+        # A solid olive page, a size up from the outline tools: the app's
+        # sign without a picture logo; the bear stays the window icon.
+        self.act_home = action(
+            "home", lambda _checked=False: self.home_requested.emit(), "app-mark-solid",
+            "Bàn bắt đầu việc", "Văn bản gần đây, quét và nhập tệp", role="mark", size=20,
         )
         toolbar.addAction(self.act_home)
+        toolbar.widgetForAction(self.act_home).setIconSize(QSize(20, 20))
+        toolbar.addSeparator()
 
-        self.act_toggle_left_panel = make_tool_action(
-            self, "panel-left",
-            "Ẩn/hiện kho văn bản ({})".format(command("toggle_library").shortcut),
-            callback=self._toggle_left_panel,
-            shortcut=command("toggle_library").shortcut,
-            checkable=True,
+        # ── Panels ─────────────────────────────────────────
+        self.act_toggle_left_panel = action(
+            "toggle_library", self._toggle_left_panel, "panel-left",
+            "Kho văn bản", "Ẩn hoặc hiện danh sách văn bản bên trái", checkable=True,
         )
         self.act_toggle_left_panel.setChecked(True)
         toolbar.addAction(self.act_toggle_left_panel)
-        self.act_toggle_details = make_tool_action(
-            self, "panel-right",
-            "Ẩn/hiện vùng chi tiết ({})".format(command("toggle_metadata").shortcut),
-            callback=self._toggle_details_panel,
-            shortcut=command("toggle_metadata").shortcut,
+        self.act_toggle_details = action(
+            "toggle_metadata", self._toggle_details_panel, "panel-right",
+            "Vùng chi tiết", "Ẩn hoặc hiện văn bản OCR và các trường bên phải",
             checkable=True,
         )
         self.act_toggle_details.setChecked(True)
         toolbar.addAction(self.act_toggle_details)
         toolbar.addSeparator()
 
-        # ── Group 2: File (split button "Thêm ▾") ─────────
-        self.act_add_file = make_tool_action(
-            self, "file-plus",
-            "Thêm văn bản ({})\nNhấn ▾ để mở tùy chọn nâng cao".format(command("add_file").shortcut),
-            callback=self.add_file,
-            shortcut=command("add_file").shortcut,
-        )
-        self.act_add_file.setText("Thêm")
+        # ── Documents in and out of the library ───────────
         add_menu = QMenu(self)
-        act_add_batch = add_menu.addAction(
-            icon("files", size=16), "Thêm nhiều tệp...\t{}".format(command("add_files").shortcut)
+        self.act_add_file = self._menu_action(
+            add_menu, "add_file", self.add_file, "file-plus", "Thêm một văn bản…")
+        act_add_batch = self._menu_action(
+            add_menu, "add_files", self.add_files, "files", "Thêm nhiều tệp…")
+        act_add_folder = self._menu_action(
+            add_menu, "add_folder", self.add_folder, "folder-open", "Nhập thư mục văn bản…")
+        self._add_button = menu_button(
+            "file-plus", "Thêm văn bản", command("add_file").shortcut,
+            "Quét một tệp, nhiều tệp hoặc cả thư mục", add_menu,
         )
-        act_add_batch.triggered.connect(self.add_files)
-        act_add_batch.setShortcut(QKeySequence(command("add_files").shortcut))
-        act_add_folder = add_menu.addAction(
-            icon("folder-open", size=16), "Nhập thư mục văn bản...\t{}".format(command("add_folder").shortcut)
-        )
-        act_add_folder.triggered.connect(self.add_folder)
-        act_add_folder.setShortcut(QKeySequence(command("add_folder").shortcut))
-
-        add_btn = QToolButton(toolbar)
-        add_btn.setDefaultAction(self.act_add_file)
-        add_btn.setMenu(add_menu)
-        add_btn.setPopupMode(QToolButton.MenuButtonPopup)
-        add_btn.setProperty("popupMode", "1")
-        add_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        toolbar.addWidget(add_btn)
-        self._act_add_batch = act_add_batch  # keep ref for shortcut registration
+        self._act_add_batch = act_add_batch
         self._act_add_folder = act_add_folder
-        toolbar.addSeparator()
 
-        # ── Group 3: Edit (single buttons) ────────────────
-        self.act_save = make_tool_action(
-            self, "save",
-            "Lưu thay đổi ({})".format(command("save").shortcut),
-            callback=self._toolbar_save_current,
-            shortcut=command("save").shortcut,
-        )
-        toolbar.addAction(self.act_save)
-
-        self.act_reset = make_tool_action(
-            self, "undo-2",
-            "Đặt lại biểu mẫu ({})".format(command("reset").shortcut),
-            callback=self._toolbar_reset_current,
-            shortcut=command("reset").shortcut,
-        )
-        toolbar.addAction(self.act_reset)
-
-        self.act_delete = make_tool_action(
-            self, "trash-2",
-            "Xóa tài liệu ({})".format(command("delete").shortcut),
-            callback=self._delete_current_document_safe,
-            shortcut=command("delete").shortcut,
-            icon_color="#B91C1C",
+        self.act_delete = action(
+            "delete", self._delete_current_document_safe, "trash-2",
+            "Xóa văn bản", "Xóa các văn bản đang chọn khỏi kho", role="danger",
         )
         toolbar.addAction(self.act_delete)
         toolbar.addSeparator()
 
-        # ── Group 4: Search (split button "Tìm ▾") ────────
-        self.act_search = make_tool_action(
-            self, "search",
-            "Tìm kiếm văn bản ({})\nNhấn ▾ để dùng AI ngữ nghĩa".format(command("search").shortcut),
-            callback=self.show_search_dialog,
-            shortcut=command("search").shortcut,
-        )
-        self.act_search.setText("Tìm")
+        # ── Find: keywords, meaning, the legal assistant ──
         search_menu = QMenu(self)
-        act_ai_search = search_menu.addAction(
-            icon("sparkles", size=16, color="#846314"),
-            "Tìm AI ngữ nghĩa...\t{}".format(command("ai_search").shortcut),
+        self.act_search = self._menu_action(
+            search_menu, "search", self.show_search_dialog, "search", "Tìm kiếm văn bản…")
+        act_ai_search = self._menu_action(
+            search_menu, "ai_search", self.show_ai_search_dialog, "sparkles",
+            "Tìm kiếm AI ngữ nghĩa…")
+        self._search_button = menu_button(
+            "search", "Tìm kiếm", command("search").shortcut,
+            "Theo từ khóa, hoặc theo ý nghĩa với AI", search_menu,
         )
-        act_ai_search.triggered.connect(self.show_ai_search_dialog)
-        act_ai_search.setShortcut(QKeySequence(command("ai_search").shortcut))
-
-        search_btn = QToolButton(toolbar)
-        search_btn.setDefaultAction(self.act_search)
-        search_btn.setMenu(search_menu)
-        search_btn.setPopupMode(QToolButton.MenuButtonPopup)
-        search_btn.setProperty("popupMode", "1")
-        search_btn.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        toolbar.addWidget(search_btn)
         self._act_ai_search = act_ai_search
 
-        self.act_chat = make_tool_action(
-            self, "panel-right", "Trợ lý pháp luật ({})".format(command("chat").shortcut),
-            callback=self._toggle_chat_panel, checkable=True,
-            shortcut=command("chat").shortcut,
-            icon_color="#846314",
+        self.act_chat = action(
+            "chat", self._toggle_chat_panel, "chat", "Trợ lý pháp luật",
+            "Hỏi về nội dung, căn cứ và hiệu lực của văn bản trong kho",
+            checkable=True,
         )
-        self.act_chat.setText("Trợ lý")
         toolbar.addAction(self.act_chat)
-        toolbar.widgetForAction(self.act_chat).setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        toolbar.addSeparator()
 
-        # ── Context label (filename · pages) ──────────────
-        # Shows which document is currently open in the center/right panels.
-        # Replaces the hidden doc_title label purged in FE-BE audit.
-        self.toolbar_context_label = QLabel("Chưa chọn tài liệu")
-        self.toolbar_context_label.setObjectName("toolbar_context")
-        self.toolbar_context_label.setProperty("empty", "true")
-        self.toolbar_context_label.setSizePolicy(
-            QSizePolicy.Expanding, QSizePolicy.Preferred
-        )
-        self.toolbar_context_label.setAlignment(Qt.AlignCenter)
-        self.toolbar_context_label.setTextInteractionFlags(
-            Qt.TextSelectableByMouse
-        )
-        toolbar.addWidget(self.toolbar_context_label)
+        # ── The open document, in the middle ─────────────
+        context = QWidget(toolbar)
+        context.setObjectName("toolbar_context")
+        context.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        row = QHBoxLayout(context)
+        row.setContentsMargins(16, 0, 16, 0)
+        row.setSpacing(8)
+        row.addStretch()
+        self._toolbar_doc_type = QLabel()
+        self._toolbar_doc_type.setObjectName("toolbar_doc_type")
+        self._toolbar_doc_number = QLabel()
+        self._toolbar_doc_number.setObjectName("toolbar_doc_number")
+        self._toolbar_doc_number.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._toolbar_doc_pages = QLabel()
+        self._toolbar_doc_pages.setObjectName("toolbar_doc_pages")
+        for label in (self._toolbar_doc_type, self._toolbar_doc_number, self._toolbar_doc_pages):
+            label.hide()
+            row.addWidget(label)
+        row.addStretch()
+        self.toolbar_context_label = context
+        self._toolbar_doc_file = ("", 0)
+        toolbar.addWidget(context)
 
-        # ── Group 5: Analytics + Export ───────────────────
-        self.act_analytics = make_tool_action(
-            self, "bar-chart-3",
-            "Phân tích thống kê (Ctrl+Shift+A)",
-            callback=self.show_analytics_dashboard,
-            shortcut=command("analytics").shortcut,
+        # ── Reports ────────────────────────────────────────
+        self.act_analytics = action(
+            "analytics", self.show_analytics_dashboard, "bar-chart-3",
+            "Phân tích thống kê", "Biểu đồ và số liệu về kho văn bản",
         )
         toolbar.addAction(self.act_analytics)
-
-        self.act_export_excel = make_tool_action(
-            self, "archive",
-            "Xuất dữ liệu ra Excel (Ctrl+E)",
-            callback=self.export_to_excel,
-            shortcut=command("export_excel").shortcut,
-            icon_color="#1D6F42",
+        self.act_export_excel = action(
+            "export_excel", self.export_to_excel, "excel",
+            "Xuất Excel", "Lưu toàn bộ kho văn bản ra một tệp Excel",
         )
         toolbar.addAction(self.act_export_excel)
         toolbar.addSeparator()
 
-        # ── Group 6: Dark mode + Overflow (⋯) ─────────────
-        self.act_dark_mode = make_tool_action(
-            self, "moon",
-            "Chế độ tối (Ctrl+D)",
-            callback=self._on_dark_mode_toggled,
-            shortcut=command("toggle_theme").shortcut,
-            checkable=True,
+        # ── Theme and everything else ─────────────────────
+        # Moon in the light theme, sun in the dark one: the icon shows where
+        # a click leads. The tooltip follows the theme (_refresh_theme_icons).
+        self.act_dark_mode = action(
+            "toggle_theme", self._on_dark_mode_toggled, "moon", "Giao diện tối",
+            checkable=True, on_name="sun",
         )
         self.act_dark_mode.setChecked(self._theme_mgr_v2.current == "dark")
         toolbar.addAction(self.act_dark_mode)
+        toolbar.widgetForAction(self.act_dark_mode).setObjectName("theme_toggle")
 
-        # Overflow menu for secondary actions — keeps the toolbar clean.
         overflow_menu = QMenu(self)
-        ov_preview = overflow_menu.addAction(
-            icon("eye", size=16), "Xem trước PDF\t{}".format(command("preview").shortcut)
-        )
-        ov_preview.setShortcut(QKeySequence(command("preview").shortcut))
-        ov_preview.triggered.connect(self.toggle_preview)
-
-        ov_refresh = overflow_menu.addAction(
-            icon("refresh-cw", size=16), "Làm mới dữ liệu\t{}".format(command("refresh").shortcut)
-        )
-        ov_refresh.setShortcut(QKeySequence(command("refresh").shortcut))
-        ov_refresh.triggered.connect(self.refresh_view)
-
+        ov_preview = self._menu_action(
+            overflow_menu, "preview", self.toggle_preview, "eye", "Xem trước PDF")
+        ov_refresh = self._menu_action(
+            overflow_menu, "refresh", self.refresh_view, "refresh-cw", "Làm mới dữ liệu")
         overflow_menu.addSeparator()
-
-        ov_settings = overflow_menu.addAction(
-            icon("settings", size=16), "Cài đặt...\t{}".format(command("settings").shortcut)
-        )
-        ov_settings.setShortcut(QKeySequence(command("settings").shortcut))
-        ov_settings.triggered.connect(self._show_settings_placeholder)
-
-        ov_backup = overflow_menu.addAction(
-            icon("database", size=16), "Sao lưu cơ sở dữ liệu..."
-        )
-        ov_backup.triggered.connect(self.backup_database)
-
-        ov_check = overflow_menu.addAction(
-            icon("folder-search", size=16), "Kiểm tra đường dẫn file..."
-        )
-        ov_check.triggered.connect(self.check_file_paths)
-
-        ov_reindex = overflow_menu.addAction(
-            icon("refresh-cw", size=16), "Xây lại chỉ mục AI..."
-        )
-        ov_reindex.triggered.connect(self.show_reindex_dialog)
-
+        # F1 and Ctrl+K are window shortcuts already (setup_shortcuts); the
+        # menu only shows them, binding them twice would make both ambiguous.
+        ov_palette = self._menu_action(
+            overflow_menu, None, self._show_command_palette, "command-search",
+            "Tìm và chạy tác vụ\t{}".format(command("command_palette").shortcut))
+        ov_shortcuts = self._menu_action(
+            overflow_menu, None, self._show_shortcut_overlay, "command",
+            "Danh sách phím tắt\t{}".format(command("shortcut_help").shortcut))
         overflow_menu.addSeparator()
+        ov_settings = self._menu_action(
+            overflow_menu, "settings", self._show_settings_placeholder, "settings", "Cài đặt…")
+        ov_backup = self._menu_action(
+            overflow_menu, None, self.backup_database, "database", "Sao lưu cơ sở dữ liệu…")
+        ov_check = self._menu_action(
+            overflow_menu, None, self.check_file_paths, "folder-search", "Kiểm tra đường dẫn tệp…")
+        ov_reindex = self._menu_action(
+            overflow_menu, None, self.show_reindex_dialog, "sync", "Xây lại chỉ mục AI…")
+        overflow_menu.addSeparator()
+        ov_help = self._menu_action(
+            overflow_menu, None, self.show_help, "help-circle", "Hướng dẫn sử dụng")
+        ov_about = self._menu_action(
+            overflow_menu, None, self.show_about, "info", "Về ứng dụng")
 
-        ov_help = overflow_menu.addAction(
-            icon("help-circle", size=16), "Hướng dẫn sử dụng"
+        overflow_btn = menu_button(
+            "more-horizontal", "Công cụ khác", "",
+            "Xem trước, làm mới, phím tắt, cài đặt, sao lưu, hướng dẫn", overflow_menu,
         )
-        ov_help.triggered.connect(self.show_help)
-
-        ov_about = overflow_menu.addAction(
-            icon("info", size=16), "Về ứng dụng..."
-        )
-        ov_about.triggered.connect(self.show_about)
-
-        overflow_btn = QToolButton(toolbar)
-        overflow_btn.setIcon(icon("more-horizontal", size=20))
-        overflow_btn.setToolTip("Công cụ khác")
-        overflow_btn.setMenu(overflow_menu)
-        overflow_btn.setPopupMode(QToolButton.InstantPopup)
-        toolbar.addWidget(overflow_btn)
-        # Keep refs for shortcut triggering across the window.
         self._overflow_menu = overflow_menu
+        self._overflow_button = overflow_btn
         self._overflow_actions = {
             "preview": ov_preview, "refresh": ov_refresh,
+            "palette": ov_palette, "shortcuts": ov_shortcuts,
             "settings": ov_settings, "backup": ov_backup,
             "check_files": ov_check, "reindex": ov_reindex,
             "help": ov_help, "about": ov_about,
         }
+
+        # Editor commands without a toolbar button: shortcut and palette only.
+        self.act_save = self._window_action("save", self._toolbar_save_current)
+        self.act_reset = self._window_action("reset", self._toolbar_reset_current)
 
         self._command_actions = {
             "home": self.act_home, "toggle_library": self.act_toggle_left_panel,
@@ -3415,21 +3560,79 @@ class MainWindow(QMainWindow):
 
         self._main_toolbar = toolbar
 
+    def _remember_icon(self, target, name, size=18, role="tool", on_name=None) -> None:
+        """Give a QAction/button its token-coloured icon and recolour it on
+        every theme switch (_refresh_theme_icons)."""
+        self._chrome_icons.append((target, name, size, role, on_name))
+        target.setIcon(chrome_icon(name, size, role=role, on_name=on_name))
+
+    def _menu_action(self, menu, command_id, callback, icon_name, text) -> QAction:
+        """A menu item with an icon; its shortcut (from the command catalogue)
+        is shown in the menu and works on the whole window."""
+        act = QAction(text, self)
+        if command_id and command(command_id).shortcut:
+            act.setShortcut(QKeySequence(command(command_id).shortcut))
+            self.addAction(act)
+        act.triggered.connect(lambda _checked=False: callback())
+        self._remember_icon(act, icon_name, 16)
+        menu.addAction(act)
+        return act
+
+    def _window_action(self, command_id, callback) -> QAction:
+        """A shortcut-only command: no button, reachable from the palette."""
+        spec = command(command_id)
+        act = QAction(spec.label, self)
+        act.setShortcut(QKeySequence(spec.shortcut))
+        act.triggered.connect(lambda _checked=False: callback())
+        self.addAction(act)
+        return act
+
+    def _current_doc_identity(self):
+        """(số hiệu, loại VB) of the open document from the library snapshot."""
+        for entry in getattr(self, "_docs_snapshot", None) or []:
+            doc = entry[0] if isinstance(entry, tuple) and len(entry) == 2 \
+                and isinstance(entry[1], dict) else entry
+            try:
+                if int(doc[0]) != int(self.current_doc_id or -1):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            so_hieu = (doc[8] or "").strip() if len(doc) > 8 else ""
+            loai_vb = (doc[9] or "").strip() if len(doc) > 9 else ""
+            return so_hieu, loai_vb
+        return "", ""
+
     def _update_toolbar_context(self, filename: str = "", page_count: int = 0) -> None:
-        """Update the toolbar center label when a document is loaded/cleared."""
-        if not hasattr(self, "toolbar_context_label"):
+        """Name the open document in the middle of the toolbar.
+
+        The number (số hiệu) in gold is the title, its type before it and
+        the page count after it are quieter; a document without a number
+        shows its file name. Separate labels, no "a · b" string; the file
+        name and the details are in the tooltip.
+        """
+        if not hasattr(self, "_toolbar_doc_number"):
             return
+        self._toolbar_doc_file = (filename, page_count)
+        kind, number, pages = self._toolbar_doc_type, self._toolbar_doc_number, self._toolbar_doc_pages
         if not filename:
-            self.toolbar_context_label.setText("Chưa chọn tài liệu")
-            self.toolbar_context_label.setProperty("empty", "true")
-        else:
-            short = filename if len(filename) <= 60 else filename[:57] + "..."
-            suffix = f" · {page_count} trang" if page_count else ""
-            self.toolbar_context_label.setText(f"{short}{suffix}")
-            self.toolbar_context_label.setProperty("empty", "false")
-        # Force stylesheet re-evaluation after dynamic property change.
-        self.toolbar_context_label.style().unpolish(self.toolbar_context_label)
-        self.toolbar_context_label.style().polish(self.toolbar_context_label)
+            for label in (kind, number, pages):
+                label.hide()
+            self.toolbar_context_label.setToolTip("")
+            return
+        so_hieu, loai_vb = self._current_doc_identity()
+        number.setProperty("kind", "number" if so_hieu else "file")
+        number.style().unpolish(number)
+        number.style().polish(number)
+        title = so_hieu or filename
+        number.setText(QFontMetrics(number.font()).elidedText(title, Qt.ElideMiddle, 420))
+        kind.setText(loai_vb)
+        kind.setVisible(bool(so_hieu and loai_vb))
+        number.show()
+        pages.setText(f"{page_count} trang" if page_count else "")
+        pages.setVisible(bool(page_count))
+        details = ", ".join(part for part in (
+            loai_vb, f"{page_count} trang" if page_count else "") if part)
+        self.toolbar_context_label.setToolTip(chrome_tooltip(filename, hint=details))
 
     # ── Toolbar action stubs / routers ──────────────────────
     def _toggle_left_panel(self, visible: bool) -> None:
@@ -3542,6 +3745,15 @@ class MainWindow(QMainWindow):
         self._set_details_visible(visible)
 
     def _on_chat_visibility_changed(self, _visible: bool) -> None:
+        # Minimising the window, or hiding it for the home screen, hides the
+        # dock too; only the reader opening or closing it (isHidden) changes
+        # the toggle and the layout. Fed straight from visibilityChanged, the
+        # toggle's toggled signal closed the dock on every minimise.
+        is_open = not self.chat_panel.isHidden()
+        self.act_chat.setChecked(is_open)
+        if is_open == self._chat_open:
+            return
+        self._chat_open = is_open
         self._details_user_choice = None
         self._layout_bucket = None
         QTimer.singleShot(0, self._apply_responsive_layout)
@@ -3567,59 +3779,23 @@ class MainWindow(QMainWindow):
         )
 
     def _refresh_theme_icons(self, theme: str) -> None:
-        """Recolor every persistent Lucide icon after a light/dark switch."""
-        base = "#E8EBF5" if theme == "dark" else "#24432D"
+        """Recolour every chrome icon from the theme tokens after a switch.
+
+        Toolbar, menus (the overflow too), the library filter and sort, the
+        PDF navigation: each icon was registered by _remember_icon with its
+        role, so a new theme repaints all of them from colors_for(theme).
+        The editor recolours its own buttons (OCRResultEditor.apply_theme,
+        called by the theme manager), so nothing here reaches into it.
+        """
         self.act_dark_mode.blockSignals(True)
         self.act_dark_mode.setChecked(theme == "dark")
         self.act_dark_mode.blockSignals(False)
-        accents = {
-            "delete": "#F87171" if theme == "dark" else "#B3263E",
-            "chat": "#E5C466" if theme == "dark" else "#846314",
-            "export_excel": "#6EE7B7" if theme == "dark" else "#1D6F42",
-        }
-        for command_id, action in getattr(self, "_command_actions", {}).items():
-            try:
-                spec = command(command_id)
-            except KeyError:
-                continue
-            if spec.icon:
-                action.setIcon(icon(spec.icon, size=20, color=accents.get(command_id, base)))
-
-        extras = {
-            getattr(self, "_act_add_batch", None): "files",
-            getattr(self, "_act_add_folder", None): "folder-open",
-            getattr(self, "_act_ai_search", None): "sparkles",
-        }
-        extras.update({
-            action: name for key, name in {
-                "backup": "database", "check_files": "folder-search",
-                "reindex": "refresh-cw", "help": "help-circle", "about": "info",
-            }.items()
-            for action in (getattr(self, "_overflow_actions", {}).get(key),)
-        })
-        for action, name in extras.items():
-            if action is not None:
-                action.setIcon(icon(name, size=16, color=base))
-
-        pdf_icons = {
-            "first_btn": "chevrons-left", "prev_btn": "chevron-left",
-            "next_btn": "chevron-right", "last_btn": "chevrons-right",
-            "zoom_out_btn": "zoom-out", "zoom_in_btn": "zoom-in",
-            "rotate_left_btn": "rotate-ccw", "rotate_right_btn": "rotate-cw",
-        }
-        for attr, name in pdf_icons.items():
-            getattr(self.pdf_viewer, attr).setIcon(icon(name, size=17, color=base))
-
-        editor_icons = {
-            "_toggle_meta_btn": "panel-right", "_calendar_btn": "calendar",
-            "reocr_btn": "refresh-cw", "_copy_btn": "copy",
-            "_export_word_btn": "file-text", "reset_btn": "undo-2",
-            "save_btn": "save",
-        }
-        for attr, name in editor_icons.items():
-            widget = getattr(self.ocr_editor, attr, None)
-            if widget is not None:
-                widget.setIcon(icon(name, size=18, color=base))
+        self.act_dark_mode.setToolTip(chrome_tooltip(
+            "Giao diện sáng" if theme == "dark" else "Giao diện tối",
+            command("toggle_theme").shortcut))
+        for target, name, size, role, on_name in getattr(self, "_chrome_icons", []):
+            target.setIcon(chrome_icon(name, size, theme, role, on_name))
+        self.pdf_viewer.apply_theme(theme)
         self.chat_panel._render_messages()
 
     def _show_settings_placeholder(self) -> None:
@@ -3693,7 +3869,6 @@ class MainWindow(QMainWindow):
             "zoom_reset": self.pdf_viewer.reset_view,
             "rotate_right": self.pdf_viewer.rotate_right,
             "rotate_left": self.pdf_viewer.rotate_left,
-            "toggle_metadata": self.ocr_editor._toggle_meta_btn.toggle,
             "shortcut_help": self._show_shortcut_overlay,
             "command_palette": self._show_command_palette,
         }
@@ -3711,20 +3886,22 @@ class MainWindow(QMainWindow):
             self.clear_selection()
 
     def setup_statusbar(self):
-        """Status bar with live indicators (Phase 12, 2026-04-18).
+        """A quiet status bar (2026-10 minimal redesign).
 
-        Layout (left → right):
-          [doc_info]  ··· stretch ···  [workers] [VRAM bar] [Llama dot] [doc count]
+          [open file name]  ··· stretch ···  [tasks] [VRAM bar  4.2/8 GB] [● Chandra]
 
-        All indicators driven by single StatusIndicatorCoordinator (10s poll,
-        paused when window not active). Light-weight: QLabel + 2 tiny custom
-        widgets, no custom paint loops.
+        Separate small labels, no "a · b" strings; what each part means is
+        in its tooltip. Tasks and VRAM hide while there is nothing to say.
+        The document count moved next to "Kho văn bản". All indicators are
+        driven by one StatusIndicatorCoordinator (10s poll, paused when the
+        window is inactive).
         """
         statusbar = self.statusBar()
+        statusbar.setSizeGripEnabled(False)
 
-        # Left side — current document info (variable width)
+        # Left side — the open document's file name (variable width)
         self.doc_info_label = QLabel("")
-        self.doc_info_label.setProperty("role", "muted")
+        self.doc_info_label.setObjectName("status_doc")
         statusbar.addWidget(self.doc_info_label, 1)  # stretch=1
 
         # Right side — live indicators (permanent widgets stack right-to-left)
@@ -3740,20 +3917,15 @@ class MainWindow(QMainWindow):
         self.worker_indicator.set_count(self._active_worker_count)
         statusbar.addPermanentWidget(self.worker_indicator)
 
-        # VRAM bar + text
+        # VRAM bar + text (hidden until nvidia-smi answers)
         self.vram_indicator = VramIndicator()
         statusbar.addPermanentWidget(self.vram_indicator)
         self._status_coord.register(self.vram_indicator)
 
-        # Llama-server status dot
+        # OCR server status dot
         self.llama_indicator = LlamaStatusIndicator()
         statusbar.addPermanentWidget(self.llama_indicator)
         self._status_coord.register(self.llama_indicator)
-
-        # Doc count (rightmost)
-        self.doc_count_label = QLabel("0 văn bản")
-        self.doc_count_label.setProperty("role", "statusStrong")
-        statusbar.addPermanentWidget(self.doc_count_label)
 
         # Kick off periodic polling.
         self._status_coord.start()
@@ -3783,24 +3955,22 @@ class MainWindow(QMainWindow):
         if hasattr(self, "worker_indicator"):
             self.worker_indicator.set_count(self._active_worker_count)
     def show_document_context_menu_by_id(self, doc_id, global_pos):
-        """Minimalist list context menu (2026-04-18 redesign).
-
-        Order: Mở PDF · OCR lại · Xuất nhanh (Word) · — · Tags · Di chuyển · — · Xóa (red)
+        """Library row context menu: open, OCR again, quick Word export;
+        tags; delete (its icon turns red under the pointer). Icons are
+        coloured from the theme tokens.
         """
         try:
             doc_id = int(doc_id)
             ctx = QMenu(self)
-            ctx_color = "#E8EBF5" if self._theme_mgr_v2.is_dark else "#24432D"
 
-            open_pdf = ctx.addAction(icon("eye", size=16, color=ctx_color), "Mở PDF")
-            reocr = ctx.addAction(icon("refresh-cw", size=16, color=ctx_color), "OCR lại")
-            quick_export = ctx.addAction(icon("file-text", size=16, color=ctx_color),
-                                         "Xuất nhanh (Word)")
+            open_pdf = ctx.addAction(chrome_icon("eye", 16), "Mở PDF")
+            reocr = ctx.addAction(chrome_icon("refresh-cw", 16), "OCR lại")
+            quick_export = ctx.addAction(chrome_icon("file-text", 16), "Xuất nhanh (Word)")
             ctx.addSeparator()
 
             # Tag submenu
-            tags_menu = ctx.addMenu("Gắn Tag")
-            tags_menu.setIcon(icon("tag", size=16, color=ctx_color))
+            tags_menu = ctx.addMenu("Gắn tag")
+            tags_menu.setIcon(chrome_icon("tag", 16))
             current_tags = set(self.db.get_document_tags(doc_id) or [])
             all_tags = list(self.db.get_all_tags() or [])
             tag_actions = {}
@@ -3811,17 +3981,11 @@ class MainWindow(QMainWindow):
                 tag_actions[act] = tag
             if all_tags:
                 tags_menu.addSeparator()
-            new_tag_action = tags_menu.addAction("+ Tag mới...")
-
-            move_action = ctx.addAction(icon("folder-open", size=16, color=ctx_color), "Di chuyển...")
-            move_action.setEnabled(False)  # placeholder until folder feature lands
+            new_tag_action = tags_menu.addAction("Tag mới…")
 
             ctx.addSeparator()
 
-            delete_action = ctx.addAction(icon("trash-2", size=16, color="#B3263E"), "Xóa")
-            delete_action.setProperty("danger", True)
-            # force stylesheet re-apply after dynamic property set
-            delete_action.setIconText("Xóa")
+            delete_action = ctx.addAction(chrome_icon("trash-2", 16, role="danger"), "Xóa")
 
             action = ctx.exec_(global_pos)
             if action is None:
@@ -4120,6 +4284,7 @@ class MainWindow(QMainWindow):
             # Process results (DB save, form fill, HTML render)
             self.ocr_completed(file_path, results, detections)
             progress.mark_completed()
+            self._warn_incomplete_ocr(file_path, results, modal=True)
 
         self.ocr_worker.finished.connect(on_finished)
         self.ocr_worker.error.connect(self.show_error)
@@ -4264,6 +4429,34 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             logger.warning(f"Legal relation dispatch failed for doc {doc_id}: {exc}")
 
+    def _warn_incomplete_ocr(self, file_path, results, modal=False):
+        """Tell the user which pages the OCR quality gate could not recover.
+
+        The document is saved without those pages' faulty text; the user
+        should check it and run "OCR lại". Returns True when a warning was
+        shown.
+        """
+        warning = (results or {}).get("OCR_Warning") if isinstance(results, dict) else ""
+        if not warning:
+            return False
+        name = os.path.basename(str(file_path))
+        message = f"{name}: {warning}"
+        logger.warning(message)
+        try:
+            self.statusBar().showMessage(message, 15000)
+        except Exception:
+            pass
+        if modal:
+            QMessageBox.warning(self, "OCR chưa trọn vẹn", message)
+        else:
+            try:
+                from toast_widget import toast_warning
+
+                toast_warning(self, message, 12000)
+            except Exception as exc:
+                logger.debug(f"Toast unavailable: {exc}")
+        return True
+
     def ocr_completed(self, file_path, results, detections):
         """Handle completion of OCR process for a single file"""
         try:
@@ -4358,6 +4551,7 @@ class MainWindow(QMainWindow):
         self._dispatch_embedding(doc_id)
         self._dispatch_relations(doc_id)
         self.chat_panel.refresh_knowledge_status()
+        self._warn_incomplete_ocr(file_path, result, modal=False)
         self._batch_processed_count = getattr(self, "_batch_processed_count", 0) + 1
         if cleanup_path is not None:
             remove_temporary_source(cleanup_path)
@@ -4380,63 +4574,105 @@ class MainWindow(QMainWindow):
             documents = self.db.get_all_documents()
             self.update_document_table(documents)
             # update_document_gallery(documents) — DEAD, gallery tab removed
-            # update_document_table already populates the minimalist list.
-            
-            # Update document count
-            doc_count = len(documents)
-            self.doc_count_label.setText(f"{doc_count} văn bản")
-            if hasattr(self, "_library_count_label"):
-                self._library_count_label.setText(f"{doc_count} văn bản")
-            
+            # update_document_table already populates the minimalist list
+            # and the count beside "Kho văn bản".
+            if self._document_open:
+                # A saved edit may have changed the number or the type.
+                self._update_toolbar_context(*self._toolbar_doc_file)
+
         except Exception as e:
             logger.error(f"Error loading documents: {str(e)}")
             QMessageBox.critical(self, "Error", f"Error loading documents: {str(e)}")
 
-    def _on_doc_filter_changed(self, text: str) -> None:
-        """Live-filter the document list by filename / so_ki_hieu substring.
+    @staticmethod
+    def _doc_of(entry):
+        """The document tuple of a snapshot entry (plain, or (doc, stats))."""
+        return entry[0] if isinstance(entry, tuple) and len(entry) == 2 \
+            and isinstance(entry[1], dict) else entry
 
-        Case-insensitive. Empty text → show all. Runs on cached snapshot
-        to avoid DB hits. Pairs with the sort combo — result is
-        (snapshot ∩ filter) sorted by current sort key.
-        """
-        text = (text or "").strip().lower()
-        if not hasattr(self, '_docs_snapshot') or self._docs_snapshot is None:
-            return
+    @staticmethod
+    def _doc_title(doc) -> str:
+        """What a library row shows: the number, else the file name."""
+        so_hieu = (doc[8] or "").strip() if len(doc) > 8 else ""
+        return so_hieu or ((doc[2] or "") if len(doc) > 2 else "")
 
-        def _doc_of(entry):
-            return entry[0] if isinstance(entry, tuple) and len(entry) == 2 \
-                and isinstance(entry[1], dict) else entry
-
+    @staticmethod
+    def _doc_matches(doc, text: str) -> bool:
+        """Case-insensitive substring over the file name and the number."""
         if not text:
-            filtered = self._docs_snapshot
-        else:
-            filtered = []
-            for entry in self._docs_snapshot:
-                doc = _doc_of(entry)
-                hay = (
-                    (doc[2] or "").lower() if len(doc) > 2 else ""
-                ) + " " + (
-                    (doc[8] or "").lower() if len(doc) > 8 else ""
-                )
-                if text in hay:
-                    filtered.append(entry)
+            return True
+        hay = " ".join(str(doc[i] or "") for i in (2, 8) if len(doc) > i)
+        return text in hay.lower()
 
-        # Apply current sort order before rebuilding.
-        sort_key = self._doc_sort_combo.currentData() if hasattr(self, '_doc_sort_combo') else 'id_desc'
-        if sort_key == 'name_desc':
-            filtered = sorted(filtered, key=lambda e: (_doc_of(e)[2] or "").lower(), reverse=True)
-        elif sort_key == 'name_asc':
-            filtered = sorted(filtered, key=lambda e: (_doc_of(e)[2] or "").lower())
-        elif sort_key == 'date_desc':
-            filtered = sorted(filtered, key=lambda e: str(_doc_of(e)[3] or ""), reverse=True)
-        elif sort_key == 'date_asc':
-            filtered = sorted(filtered, key=lambda e: str(_doc_of(e)[3] or ""))
-        elif sort_key == 'id_asc':
-            filtered = sorted(filtered, key=lambda e: int(_doc_of(e)[0] or 0))
-        else:
-            filtered = sorted(filtered, key=lambda e: -int(_doc_of(e)[0] or 0))
+    @staticmethod
+    def _issued_key(value):
+        """dd/mm/yyyy (or yyyy-mm-dd) -> (y, m, d); None when unreadable."""
+        import re as _re
+        match = _re.match(r"\s*(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})", value or "")
+        if match:
+            return int(match.group(3)), int(match.group(2)), int(match.group(1))
+        match = _re.match(r"\s*(\d{4})-(\d{1,2})-(\d{1,2})", value or "")
+        if match:
+            return int(match.group(1)), int(match.group(2)), int(match.group(3))
+        return None
 
-        self._rebuild_doc_list_only(filtered)
+    def _sorted_docs(self, entries):
+        """Order snapshot entries by the sort chosen in the library menu."""
+        import re as _re
+        key = getattr(self, "_doc_sort_key", "date_desc")
+        doc_of = self._doc_of
+
+        def doc_id(entry):
+            try:
+                return int(doc_of(entry)[0])
+            except (TypeError, ValueError, IndexError):
+                return 0
+
+        if key in ("issued_desc", "issued_asc"):
+            issued = getattr(self, "_doc_issued", {})
+            dated = [e for e in entries if self._issued_key(issued.get(doc_id(e)))]
+            undated = [e for e in entries if not self._issued_key(issued.get(doc_id(e)))]
+            dated.sort(key=lambda e: (self._issued_key(issued.get(doc_id(e))), doc_id(e)),
+                       reverse=key == "issued_desc")
+            return dated + undated  # documents without a date stay at the end
+        if key in ("name_asc", "name_desc"):
+            def natural(entry):  # "23/KH" before "105/KH"
+                parts = _re.split(r"(\d+)", self._doc_title(doc_of(entry)).casefold())
+                return [int(p) if p.isdigit() else p for p in parts]
+            return sorted(entries, key=natural, reverse=key == "name_desc")
+        return sorted(entries, key=lambda e: (str(doc_of(e)[3] or ""), doc_id(e)),
+                      reverse=key != "date_asc")
+
+    def _update_library_count(self, shown: int) -> None:
+        total = len(getattr(self, "_docs_snapshot", None) or [])
+        label = self._library_count_label
+        if shown == total:
+            label.setText(str(total))
+            label.setToolTip(f"{total} văn bản trong kho")
+        else:
+            label.setText(f"{shown} / {total}")
+            label.setToolTip(f"Đang hiện {shown} trong {total} văn bản")
+
+    def _on_doc_filter_changed(self, text: str = None) -> None:
+        """Show the library through the filter text and the chosen order.
+
+        Case-insensitive substring over the file name and the number, on the
+        cached snapshot (no DB hit); the selection survives the rebuild.
+        """
+        if getattr(self, "_docs_snapshot", None) is None:
+            return
+        if text is None:
+            text = self._doc_filter_input.text()
+        text = (text or "").strip().lower()
+        shown = self._sorted_docs([
+            entry for entry in self._docs_snapshot
+            if self._doc_matches(self._doc_of(entry), text)
+        ])
+        selected = self.doc_list.selected_doc_ids()
+        self._rebuild_doc_list_only(shown)
+        for doc_id in selected:
+            self.doc_list.find_and_select(doc_id)
+        self._update_library_count(len(shown))
 
     def _lazy_load_hover_meta(self, doc_id: int, _item) -> None:
         """Fetch loai_vb + nd_chinh + van_ban preview from DB on first hover.
@@ -4498,51 +4734,21 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.debug(f"Lazy hover meta for doc_id={doc_id} failed: {e}")
 
-    def _on_doc_sort_changed(self, _idx: int) -> None:
-        """Re-render the doc list with new sort order. Preserves selection."""
-        if not hasattr(self, '_docs_snapshot') or self._docs_snapshot is None:
+    def _on_doc_sort_changed(self, key) -> None:
+        """A sort chosen in the library menu: re-render, keep the selection."""
+        if key not in self._doc_sort_actions:
             return
-        selected = self.doc_list.selected_doc_ids() if hasattr(self, 'doc_list') else []
-        sort_key = self._doc_sort_combo.currentData()
+        self._doc_sort_key = key
+        self._doc_sort_actions[key].setChecked(True)
+        self._update_doc_sort_tooltip()
+        self._on_doc_filter_changed()
 
-        def _doc_of(entry):
-            return entry[0] if isinstance(entry, tuple) and len(entry) == 2 \
-                and isinstance(entry[1], dict) else entry
-
-        def sort_fn(entry):
-            d = _doc_of(entry)
-            try:
-                did = int(d[0])
-            except Exception:
-                did = 0
-            name = (d[2] or "") if len(d) > 2 else ""
-            date = str(d[3]) if len(d) > 3 else ""
-            if sort_key == 'id_desc': return (-did,)
-            if sort_key == 'id_asc':  return (did,)
-            if sort_key == 'name_asc':  return (name.lower(), did)
-            if sort_key == 'name_desc': return (tuple(-ord(c) for c in name.lower()[:1]) or (0,), -did)
-            if sort_key == 'date_desc': return (date,) if date else ("",)
-            if sort_key == 'date_asc':  return (date,) if date else ("",)
-            return (-did,)
-
-        reverse = sort_key in ('name_desc', 'date_desc')
-        # name_desc we handle via reverse flag on lowercase name.
-        if sort_key == 'name_desc':
-            sorted_docs = sorted(self._docs_snapshot,
-                                 key=lambda e: (_doc_of(e)[2] or "").lower(),
-                                 reverse=True)
-        elif sort_key == 'date_desc':
-            sorted_docs = sorted(self._docs_snapshot,
-                                 key=lambda e: str(_doc_of(e)[3] or ""),
-                                 reverse=True)
-        else:
-            sorted_docs = sorted(self._docs_snapshot, key=sort_fn)
-
-        self._rebuild_doc_list_only(sorted_docs)
-        # Restore selection where possible.
-        if selected:
-            for doc_id in selected:
-                self.doc_list.find_and_select(doc_id)
+    def _update_doc_sort_tooltip(self) -> None:
+        label = dict(item for item in self.DOC_SORTS if item[0])[self._doc_sort_key]
+        self._doc_sort_btn.setToolTip(chrome_tooltip("Sắp xếp", hint=f"Đang theo: {label}"))
+        # A non-default order shows as a checked (olive) button.
+        self._doc_sort_btn.setCheckable(True)
+        self._doc_sort_btn.setChecked(self._doc_sort_key != "date_desc")
 
     def _rebuild_doc_list_only(self, documents) -> None:
         """Rebuild visible list using BATCHED DB query for previews.
@@ -4598,6 +4804,7 @@ class MainWindow(QMainWindow):
                 'size_mb': compute_file_size_mb(doc[1] if len(doc) > 1 else None),
                 'filename': filename,
                 'path': doc[1] if len(doc) > 1 else '',
+                'issued': getattr(self, '_doc_issued', {}).get(doc_id, ''),
             }
 
             if van_ban_preview and len(van_ban_preview) >= 300:
@@ -4618,6 +4825,12 @@ class MainWindow(QMainWindow):
         """
         # Snapshot for sort re-renders.
         self._docs_snapshot = list(documents)
+        self._doc_issued = {}  # doc_id -> ngày ban hành, for the rows and the sort
+        filter_text = self._doc_filter_input.text().strip().lower() \
+            if hasattr(self, "_doc_filter_input") else ""
+        sort_key = getattr(self, "_doc_sort_key", "date_desc")
+        if not sort_key.startswith("issued"):
+            documents = self._sorted_docs(documents)
 
         # Visible minimalist list — rebuild from scratch.
         self.doc_list.clear()
@@ -4648,9 +4861,12 @@ class MainWindow(QMainWindow):
             nd_chinh = ''
             loai_vb_val = ''
             van_ban_preview = ''
+            issued = ''
             try:
                 version = self.db.get_latest_version(doc_id)
                 if version:
+                    if len(version) > 6 and version[6]:
+                        issued = str(version[6]).strip()
                     if len(version) > 9 and version[9]:
                         loai_vb_val = str(version[9]).strip()
                     if len(version) > 10 and version[10]:
@@ -4677,7 +4893,9 @@ class MainWindow(QMainWindow):
                 'size_mb': compute_file_size_mb(doc[1] if len(doc) > 1 else None),
                 'filename': filename,
                 'path': doc[1] if len(doc) > 1 else '',
+                'issued': issued,
             }
+            self._doc_issued[doc_id] = issued
 
             # Status based on actual van_ban length (not heuristic).
             if van_ban_preview and len(van_ban_preview) >= 300:
@@ -4686,7 +4904,15 @@ class MainWindow(QMainWindow):
                 status = 'partial'
             else:
                 status = 'pending'
-            self.doc_list.add_document(doc_id, filename, status, stats, meta)
+            if self._doc_matches(doc, filter_text):
+                self.doc_list.add_document(doc_id, filename, status, stats, meta)
+
+        if sort_key.startswith("issued"):
+            self._on_doc_filter_changed()  # needs the dates gathered above
+        else:
+            self._update_library_count(self.doc_list.count())
+        if self.current_doc_id is not None:
+            self.doc_list.find_and_select(self.current_doc_id)
 
     # PURGED 2026-04-18: Gallery widget removed from UI. Dead code deleted:
     #   - Earlier show_document duplicate (Python used the later one anyway)
@@ -4851,7 +5077,7 @@ class MainWindow(QMainWindow):
                 else:
                     self.metadata_fields['filesize'].setText(f"{size_bytes/(1024*1024):.1f} MB")
             else:
-                self.metadata_fields['filesize'].setText("File not found")
+                self.metadata_fields['filesize'].setText("Không tìm thấy tệp")
                     
             # Version count
             versions = self.db.get_document_versions(doc_info[0])
@@ -4866,29 +5092,21 @@ class MainWindow(QMainWindow):
             do_khan = doc_version[7] or 'Không'  # Chỉ số 7 là do_khan trong bảng
             self.metadata_fields['do_khan'].setText(do_khan)
             
-            # Định dạng màu cho độ khẩn
-            if do_khan == 'Hỏa Tốc':
-                self.metadata_fields['do_khan'].setStyleSheet("color: red; font-weight: bold;")
-            elif do_khan == 'Thượng Khẩn':
-                self.metadata_fields['do_khan'].setStyleSheet("color: orangered; font-weight: bold;")
-            elif do_khan == 'Khẩn':
-                self.metadata_fields['do_khan'].setStyleSheet("color: orange; font-weight: bold;")
-            else:
-                self.metadata_fields['do_khan'].setStyleSheet("")
-                
-            # Độ mật with color coding
+            # Độ mật
             do_mat = doc_version[8] or 'Không'  # Chỉ số 8 là do_mat trong bảng
             self.metadata_fields['do_mat'].setText(do_mat)
-            
-            # Định dạng màu cho độ mật
-            if do_mat == 'Mật':
-                self.metadata_fields['do_mat'].setStyleSheet("color: darkgreen; font-weight: bold;")
-            elif do_mat == 'Tối Mật':
-                self.metadata_fields['do_mat'].setStyleSheet("color: darkblue; font-weight: bold;")
-            elif do_mat == 'Tuyệt Mật':
-                self.metadata_fields['do_mat'].setStyleSheet("color: purple; font-weight: bold;")
-            else:
-                self.metadata_fields['do_mat'].setStyleSheet("")
+
+            # NĐ30 urgency and classification in their token colours (theme
+            # stylesheet, [level=...]), so they read in both themes.
+            levels = {
+                'Hỏa Tốc': 'hoa_toc', 'Thượng Khẩn': 'thuong_khan', 'Khẩn': 'khan',
+                'Mật': 'mat', 'Tối Mật': 'toi_mat', 'Tuyệt Mật': 'tuyet_mat',
+            }
+            for key, value in (('do_khan', do_khan), ('do_mat', do_mat)):
+                field = self.metadata_fields[key]
+                field.setProperty("level", levels.get(value, ""))
+                field.style().unpolish(field)
+                field.style().polish(field)
                     
         except Exception as e:
             logger.error(f"Error updating metadata: {str(e)}")
@@ -4898,10 +5116,11 @@ class MainWindow(QMainWindow):
     def update_status_info(self, doc_id, doc_info):
         """Update status bar with document info"""
         if doc_info and os.path.exists(doc_info[1]):
-            file_info = f"ID: {doc_id} | {os.path.basename(doc_info[1])}"
-            self.doc_info_label.setText(file_info)
+            self.doc_info_label.setText(os.path.basename(doc_info[1]))
+            self.doc_info_label.setToolTip(f"Mã {doc_id}\n{doc_info[1]}")
         else:
             self.doc_info_label.setText("")
+            self.doc_info_label.setToolTip("")
 
     def document_selected_by_id(self, doc_id):
         """Handle document selection from the new DocumentListWidget."""
@@ -4952,8 +5171,11 @@ class MainWindow(QMainWindow):
                 # Reload the same document
                 self.show_document(doc_id)
 
+                # A manual edit can change the number, signer or cited
+                # documents, so the legal graph is refreshed with the chunks.
                 self._dispatch_embedding(doc_id)
-                
+                self._dispatch_relations(doc_id)
+
                 # Update suggestions
                 self.ocr_editor.update_suggestions(self.db)
                 
@@ -5053,40 +5275,15 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(200, lambda: self.highlight_search_keywords(keywords))
 
     def highlight_search_keywords(self, keywords):
-        """Bôi vàng từ khóa tìm kiếm trong OCR output"""
-        if not hasattr(self, 'ocr_editor'):
-            return
+        """Mark the search keywords in the full text of the open document.
 
-        # Tìm QTextEdit chứa văn bản dạng txt trong ocr_editor
-        text_edit = None
-        if hasattr(self.ocr_editor, 'van_ban_txt_edit'):
-            text_edit = self.ocr_editor.van_ban_txt_edit
-        elif hasattr(self.ocr_editor, 'fields') and 'van_ban_dang_txt' in self.ocr_editor.fields:
-            text_edit = self.ocr_editor.fields['van_ban_dang_txt']
-
-        if text_edit is None:
-            return
-
-        # Clear old highlights
-        cursor = text_edit.textCursor()
-        cursor.select(QTextCursor.Document)
-        fmt = QTextCharFormat()
-        fmt.setBackground(QColor(Qt.transparent))
-        cursor.mergeCharFormat(fmt)
-
-        # Apply yellow highlights cho từng keyword
-        highlight_fmt = QTextCharFormat()
-        highlight_fmt.setBackground(QColor("yellow"))
-
-        for keyword in keywords:
-            cursor = text_edit.textCursor()
-            cursor.movePosition(QTextCursor.Start)
-
-            while True:
-                cursor = text_edit.document().find(keyword, cursor)
-                if cursor.isNull():
-                    break
-                cursor.mergeCharFormat(highlight_fmt)
+        The editor owns the marks: it paints them in the theme's colours
+        (gold wash, text colour on top, readable in dark too), clears the
+        earlier ones and paints them again after a theme switch.
+        """
+        editor = getattr(self, 'ocr_editor', None)
+        if editor is not None:
+            editor.highlight_keywords(keywords)
 
     def export_to_excel(self):
         """Export all documents to Excel with optional filtering"""
@@ -5181,120 +5378,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Lỗi", f"Không thể mở Analytics Dashboard: {str(e)}")
 
     def show_about(self):
-        """About dialog using the same replaceable wordmark as the landing."""
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Về ứng dụng")
-        dialog.setFixedSize(520, 480)
-        dialog.setStyleSheet("QDialog { background: #F5F1E8; }")
-
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(24, 24, 24, 20)
-        layout.setSpacing(16)
-
-        # ── Header: logo + title ──────────────────────────────────
-        header = QHBoxLayout()
-        header.setSpacing(16)
-
-        logo_label = QLabel("OV")
-        logo_label.setFixedSize(72, 72)
-        logo_label.setAlignment(Qt.AlignCenter)
-        logo_label.setStyleSheet(
-            "color:#24432D;border:1px solid #24432D;border-radius:16px;"
-            "font-size:20pt;font-weight:700;background:#FFFEFA;"
-        )
-        header.addWidget(logo_label)
-
-        title_col = QVBoxLayout()
-        title_col.setSpacing(2)
-        app_title = QLabel("OCR VBHC Desktop")
-        app_title.setStyleSheet(
-            "font-size: 18pt; font-weight: 700; color: #24432D;"
-            " font-family: 'Be Vietnam Pro';"
-        )
-        title_col.addWidget(app_title)
-        version_label = QLabel(f"Phiên bản {APP_VERSION} · Build 2026-04-17")
-        version_label.setStyleSheet(
-            "font-size: 10pt; color: #5C665F; font-family: 'Be Vietnam Pro';"
-        )
-        title_col.addWidget(version_label)
-        title_col.addStretch()
-        header.addLayout(title_col, 1)
-
-        layout.addLayout(header)
-
-        # ── Divider ───────────────────────────────────────────────
-        divider = QFrame()
-        divider.setFrameShape(QFrame.HLine)
-        divider.setStyleSheet("background: #D8D1C3; max-height: 1px; border: none;")
-        layout.addWidget(divider)
-
-        # ── Tagline ───────────────────────────────────────────────
-        tagline = QLabel(
-            "Rút ngắn thời gian phân loại và tìm kiếm văn bản dạng PDF theo "
-            "<b>Nghị định 30/2020/NĐ-CP</b>."
-        )
-        tagline.setWordWrap(True)
-        tagline.setStyleSheet(
-            "font-size: 11pt; color: #17231B; font-family: 'Be Vietnam Pro';"
-            " line-height: 1.5;"
-        )
-        layout.addWidget(tagline)
-
-        # ── Features ──────────────────────────────────────────────
-        features_label = QLabel("Tính năng chính")
-        features_label.setStyleSheet(
-            "font-size: 10pt; font-weight: 700; color: #24432D;"
-            " font-family: 'Be Vietnam Pro'; margin-top: 4px;"
-        )
-        layout.addWidget(features_label)
-
-        features_list = QLabel(
-            "<ul style='margin: 4px 0 4px 12px; line-height: 1.7;'>"
-            "<li>Chandra OCR 2 — trích xuất 12 trường NĐ 30/2020</li>"
-            "<li>Tìm kiếm ngữ nghĩa (AI + rerank) trên toàn bộ kho văn bản</li>"
-            "<li>Xuất Word / Excel / HTML / Markdown một nút bấm</li>"
-            "<li>Hoạt động 100% offline — an toàn, bảo mật dữ liệu</li>"
-            "</ul>"
-        )
-        features_list.setTextFormat(Qt.RichText)
-        features_list.setStyleSheet(
-            "font-size: 10pt; color: #17231B; font-family: 'Be Vietnam Pro';"
-        )
-        layout.addWidget(features_list)
-
-        layout.addStretch()
-
-        # ── Divider ───────────────────────────────────────────────
-        divider2 = QFrame()
-        divider2.setFrameShape(QFrame.HLine)
-        divider2.setStyleSheet("background: #D8D1C3; max-height: 1px; border: none;")
-        layout.addWidget(divider2)
-
-        # ── Footer: credits + close button ────────────────────────
-        footer = QHBoxLayout()
-        credits = QLabel(
-            "© 2026 <b>OCR VBHC</b><br/>Xử lý hoàn toàn cục bộ"
-        )
-        credits.setTextFormat(Qt.RichText)
-        credits.setStyleSheet(
-            "font-size: 9pt; color: #5C665F; font-family: 'Be Vietnam Pro';"
-        )
-        footer.addWidget(credits, 1)
-
-        close_btn = QPushButton("Đóng")
-        close_btn.setFixedWidth(100)
-        close_btn.setStyleSheet(
-            "QPushButton { background: #24432D; color: #F5F1E8;"
-            " border: none; border-radius: 6px; padding: 8px 16px;"
-            " font-weight: 600; font-family: 'Be Vietnam Pro'; }"
-            "QPushButton:hover { background: #315A3E; }"
-        )
-        close_btn.clicked.connect(dialog.accept)
-        footer.addWidget(close_btn)
-
-        layout.addLayout(footer)
-
+        """About the app: the home page's about sheet as a dialog."""
+        dialog = AboutDialog(self)
         dialog.exec_()
+        dialog.deleteLater()  # a child of the window; do not keep one per opening
 
     def show_help(self):
         """Show help documentation"""
@@ -5344,6 +5431,7 @@ class MainWindow(QMainWindow):
 
         self.detections_by_page = {}
         self.doc_info_label.setText("")
+        self.doc_info_label.setToolTip("")
         self._update_toolbar_context("", 0)
         QTimer.singleShot(0, self._apply_responsive_layout)
 

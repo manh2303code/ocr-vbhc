@@ -61,10 +61,9 @@ OCR_MODELS = {
         "name": "Chandra OCR 2 (Q4, cân bằng)",
         "model_file": "chandra/chandra-ocr-2-q4_k_m.gguf",
         "mmproj_file": "chandra/chandra-ocr-2.mmproj-q8_0.gguf",
-        # 2026-04-17 reverted 16384→8192: 8GB VRAM saturates at 16384 KV cache
-        # → layer offload → 2× slowdown (27 tok/s vs 57 tok/s baseline).
-        # Bump back to 16384 via OCR_CTX_SIZE env var when processing rare
-        # multi-page dense tables that truncate at 8192.
+        # Total context of the legacy layout only (OCR_KV_LAYOUT=legacy):
+        # one 8192-cell pool shared by every slot. The default per-slot
+        # layout sizes the server from OCR_SLOT_CTX instead (see below).
         "ctx_size": int(os.environ.get("OCR_CTX_SIZE", 8192)),
         "vram_mb": 3500,
         "speed": "~20s/page GPU (ctx=8192)",
@@ -176,11 +175,56 @@ if ACTIVE_OCR_MODEL not in OCR_MODELS:
     ACTIVE_OCR_MODEL = "chandra-q4"
 LLAMA_FLASH_ATTN = True
 
+# ─── Chandra llama-server context layout ─────────────────────────
+# Measured 2026-10-15 (ocr_bench/research/chandra_ocr2.md §4.2-4.7):
+# * Without -np the server picks 4 slots that share ONE 8192-cell KV pool
+#   (kv_unified). Two pages in flight (2 workers on a 16-24 GB GPU) overflow
+#   it as soon as one is landscape (3881 prompt tokens) and BOTH requests end
+#   with "Context size has been exceeded".
+# * Chandra 2 is hybrid: only 8/32 layers keep KV, ~32 KiB per cell, so a
+#   12288-cell slot costs 384 MiB. 12288 >= largest prompt (4181: image
+#   capped at 4096 tokens + 85 text) + OCR_MAX_TOKENS 6000 + margin.
+# * The RAM prompt cache (default 8192 MiB) never hits: every page image is
+#   unique and the hybrid model forces full prompt re-processing.
+# "per-slot" (default): -np <workers> -c <workers x OCR_SLOT_CTX> --cache-ram 0.
+# "legacy": the pre-2026-10 flags (-c OCR_CTX_SIZE, auto slots, default
+# prompt cache), kept selectable for A/B measurement.
+OCR_KV_LAYOUT = os.environ.get("OCR_KV_LAYOUT", "per-slot").strip().lower()
+OCR_SLOT_CTX = int(os.environ.get("OCR_SLOT_CTX", 12288))
+OCR_CACHE_RAM_MB = int(os.environ.get("OCR_CACHE_RAM_MB", 0))
+
+# The GGUF embeds Qwen3.5's own template, which opens a <think> block unless
+# enable_thinking is false; Datalab serves Chandra with thinking off. With it
+# on, a page can turn into thousands of tokens of English planning prose and
+# no HTML (bench page CV-1_p2, 2 pages of the live DB). OCR_DISABLE_THINKING=0
+# restores the old request for A/B measurement.
+OCR_DISABLE_THINKING = os.environ.get("OCR_DISABLE_THINKING", "1").strip() != "0"
+
+
+def ocr_server_context_args(parallel_slots: int, model_key: Optional[str] = None) -> List[str]:
+    """llama-server context flags for the OCR server with N worker slots."""
+    if OCR_KV_LAYOUT == "legacy":
+        profile = OCR_MODELS.get(model_key or ACTIVE_OCR_MODEL, {})
+        return ["-c", str(profile.get("ctx_size", 8192))]
+    slots = max(1, int(parallel_slots or 1))
+    return [
+        "-np", str(slots),
+        "-c", str(slots * OCR_SLOT_CTX),
+        "--cache-ram", str(OCR_CACHE_RAM_MB),
+    ]
+
+
+def ocr_request_options() -> dict:
+    """Extra chat-completion fields sent with every OCR request."""
+    if OCR_DISABLE_THINKING:
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+    return {}
+
+
 # OCR defaults — minimal sampling parameters keep transcription deterministic.
-# Sized to fit default ctx=8192 (reverted from 16384 for speed — see ctx_size
-# comment above). ctx=8192 − ~2200 prompt = ~6000 output headroom.
-# Override via OCR_MAX_TOKENS env when running with OCR_CTX_SIZE=16384 for
-# dense multi-page tables (use OCR_MAX_TOKENS=13000 in that case).
+# Largest observed page output is ~2900 tokens (live DB) and p95 ~1450 (bench),
+# so 6000 leaves 2x headroom; with a 12288-cell slot the prompt (<= 4181) can
+# no longer eat into it as it did in the shared 8192 pool.
 OCR_MAX_TOKENS = int(os.environ.get("OCR_MAX_TOKENS", 6000))
 # Per-field max tokens — small for precise fields, larger for content fields
 OCR_FIELD_MAX_TOKENS = {
@@ -197,6 +241,12 @@ OCR_FIELD_MAX_TOKENS = {
 OCR_DEFAULT_FIELD_TOKENS = 64
 OCR_TEMPERATURE = 0.0
 OCR_REPEAT_PENALTY = 1.0
+# A page rejected by the quality gate (llama_ocr.assess_page) is generated
+# once more with Chandra's own retry sampling (chandra/model/vllm.py:
+# temperature 0.2 on the first retry, top_p 0.95); greedy decoding would
+# only reproduce the same loop.
+OCR_RETRY_TEMPERATURE = 0.2
+OCR_RETRY_TOP_P = 0.95
 
 # Chandra OCR 2 — prompt comparison (2026-04-17):
 #
@@ -228,19 +278,28 @@ def get_ocr_system_prompt(model_key: Optional[str] = None) -> str:
 # ─── Chat model profiles ─────────────────────────────────────────
 CHAT_PORT = _validated_port(os.environ.get("CHAT_PORT", "9998"), 9998)
 
+# Context sizes (research/token_budget_audit.md §3.9). A request is about 1350
+# tokens of instructions and tool schemas, 3200 per block of sources (prefetch
+# or a tool round), up to 1500 of chat history and up to 2048 of answer.
+# Qwen3-8B stays at 16384: on 10-turn conversations of three-round lookups
+# its largest prompt was 13680 of the 14080 budget, with no trim, against
+# 32768 that held 1224 MiB more KV for the same result (q8_0 KV: 76.5 KiB per
+# token for both models; research/token-limits_results.md §8.5).
+# The CPU context is 8192 with small source blocks (agent_tools) and one tool
+# round: prompt processing on CPU runs at tens of tokens per second.
 CHAT_MODELS = {
     "qwen3-8b": {
         "name": "Qwen3-8B (chất lượng cao)",
         "model_file": "chat/Qwen3-8B-Q4_K_M.gguf",
         "ctx_gpu": 16384,
-        "ctx_cpu": 4096,
+        "ctx_cpu": 8192,
         "min_vram_mb": 10000,
     },
     "qwen3-4b": {
         "name": "Qwen3-4B (nhanh, mặc định)",
         "model_file": "chat/Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
-        "ctx_gpu": 8192,
-        "ctx_cpu": 4096,
+        "ctx_gpu": 16384,
+        "ctx_cpu": 8192,
         "min_vram_mb": 5000,
     },
 }
@@ -282,6 +341,12 @@ def select_chat_model(vram_mb: Optional[int] = None) -> Tuple[str, str]:
     elif override:
         logger.warning("Unknown chat model %r; using automatic selection", override)
     return model_key, backend
+
+
+def chat_context_size(model_key: str, backend: str) -> int:
+    """Context tokens to start the chat model with on this backend."""
+    profile = CHAT_MODELS[model_key]
+    return profile["ctx_gpu" if backend == "cuda" else "ctx_cpu"]
 
 
 def get_chat_model_path(model_key: str) -> Optional[Path]:

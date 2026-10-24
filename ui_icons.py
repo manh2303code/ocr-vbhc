@@ -26,22 +26,38 @@ from PyQt5.QtWidgets import QAction, QWidget
 
 logger = logging.getLogger("UIIcons")
 
-_ICON_DIR = Path(__file__).parent / "icons" / "lucide"
+_ICON_DIR = Path(__file__).parent / "icons" / "fluent"
 _CACHE: dict[tuple, QIcon] = {}  # key: (name, size, color) → QIcon
 
 
-def icon(name: str, size: int = 20, color: str = "#24432D") -> QIcon:
-    """Load an SVG icon from icons/lucide/ with color tinting + cache.
+def _default_color() -> str:
+    """The quiet icon colour of the current theme, from the tokens."""
+    import theme_tokens
+
+    try:
+        from theme_manager_v2 import ThemeManager
+        theme = ThemeManager.instance().current
+        theme = theme() if callable(theme) else theme
+    except Exception:
+        theme = "light"
+    return theme_tokens.colors_for(theme)["text_secondary"]
+
+
+def icon(name: str, size: int = 20, color: Optional[str] = None) -> QIcon:
+    """Load an SVG icon from icons/fluent/ with color tinting + cache.
 
     Args:
         name: SVG basename without extension (e.g. "panel-left")
         size: pixel size — 16/20/24 most common
-        color: hex string for stroke color
+        color: hex string for the fill/stroke; None = the current theme's
+            quiet icon colour (text_secondary token)
 
     Returns:
         QIcon ready for setIcon(). Returns empty QIcon if file missing
         (logs warning once, doesn't raise).
     """
+    if color is None:
+        color = _default_color()
     key = (name, size, color)
     if key in _CACHE:
         return _CACHE[key]
@@ -54,12 +70,12 @@ def icon(name: str, size: int = 20, color: str = "#24432D") -> QIcon:
 
     try:
         # Read + recolor SVG via text substitution (simple, no DOM parse).
-        # Lucide icons use stroke="currentColor" or explicit stroke colors.
-        # We substitute stroke="..." values with our chosen color.
+        # Fluent icons are filled shapes with fill="currentColor" on the root
+        # (devtools/fetch_fluent_icons.py adds it); stroke covers older SVGs.
         svg_text = svg_path.read_text(encoding="utf-8")
-        # Replace common stroke patterns. Lucide standard: stroke="currentColor".
         colored_svg = (
             svg_text
+            .replace('fill="currentColor"', f'fill="{color}"')
             .replace('stroke="currentColor"', f'stroke="{color}"')
             .replace("stroke='currentColor'", f"stroke='{color}'")
         )
@@ -75,10 +91,9 @@ def icon(name: str, size: int = 20, color: str = "#24432D") -> QIcon:
         renderer.render(painter)
         painter.end()
 
-        # Scale down for crisp display at target size.
-        pixmap = pixmap.scaled(
-            size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation
-        )
+        # Keep the 2x pixels: at 150-200% display scaling Qt draws them
+        # directly instead of upscaling a 1x pixmap into a blur.
+        pixmap.setDevicePixelRatio(2.0)
         qicon = QIcon(pixmap)
         _CACHE[key] = qicon
         return qicon
@@ -96,7 +111,7 @@ def make_tool_action(
     shortcut: Optional[str] = None,
     checkable: bool = False,
     icon_size: int = 20,
-    icon_color: str = "#24432D",
+    icon_color: Optional[str] = None,
 ) -> QAction:
     """Create a QAction ready for QToolBar.addAction() or menu.
 
@@ -105,7 +120,7 @@ def make_tool_action(
 
     Args:
         parent: parent QWidget (the MainWindow usually)
-        icon_name: Lucide SVG name (see icons/lucide/)
+        icon_name: icon name (see icons/fluent/ and icons/fluent/MANIFEST.json)
         tooltip: includes shortcut hint ("Tìm kiếm (Ctrl+F)")
         callback: slot connected to triggered signal
         shortcut: QKeySequence string (None to skip)
@@ -135,7 +150,7 @@ def clear_icon_cache() -> None:
     _CACHE.clear()
 
 
-def preload_icons(names: list[str], size: int = 20, color: str = "#24432D") -> None:
+def preload_icons(names: list[str], size: int = 20, color: Optional[str] = None) -> None:
     """Pre-warm cache for known icons at app startup.
 
     Reduces first-interaction latency. Call from MainWindow.__init__.

@@ -7,6 +7,13 @@ tooltip. Works real-time with no custom code (Qt handles show/hide/
 position automatically). Previous custom QFrame implementation was brittle
 on Windows (translucent bg, viewport event filter misses).
 
+2026-10 minimal redesign: a row is a status dot, the document number (or
+the file name while there is none) and the issue date. The legend that
+explained the dots, the summary, page count and file name moved into the
+row tooltip, which is built from the theme tokens so it reads in both
+themes. Colours come from theme_tokens only; the row and list styling is
+in the theme stylesheet (objectNames library_list, doc_row_*).
+
 Public API:
     widget.clear()
     widget.add_document(doc_id, filename, status, stats, meta)
@@ -17,97 +24,111 @@ Public API:
         doc_clicked(int)
         context_menu_requested(int, QPoint)
         hover_requested(int, QListWidgetItem)  — for lazy DB fetch
-
-Tooltip styling is set globally on QApplication via brand-themed QToolTip
-stylesheet (cream bg, gold border, olive text). Set in main_window_1
-after QApplication creation.
 """
 from __future__ import annotations
 
 import os
 import html as html_lib
-from pathlib import Path
 from typing import Optional
 
-from PyQt5.QtCore import Qt, QPoint, QSize, QEvent, pyqtSignal
-from PyQt5.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
+from PyQt5.QtCore import Qt, QPoint, pyqtSignal
+from PyQt5.QtGui import QColor, QFontMetrics, QPainter, QPen
 from PyQt5.QtWidgets import (
     QListWidget, QListWidgetItem, QWidget, QLabel, QHBoxLayout,
     QSizePolicy,
 )
 
 
+def _theme_tokens(theme: Optional[str] = None) -> dict:
+    """Colours of a theme (the current one when not given)."""
+    from theme_tokens import colors_for
+    if theme is None:
+        try:
+            from theme_manager_v2 import ThemeManager
+            theme = ThemeManager.instance().current
+        except Exception:
+            theme = "light"
+    return colors_for(theme)
+
+
+STATUS_LABELS = {
+    'done':    'Đã OCR đầy đủ',
+    'partial': 'OCR chưa đủ, văn bản còn ngắn',
+    'pending': 'Chưa OCR',
+}
+
+
 # ── Row widget ─────────────────────────────────────────────────────
 class DocumentRow(QWidget):
-    """Single list row: [status dot] [STT 3-digit] [filename]."""
+    """Single list row: [status dot] [số hiệu or file name] [issue date]."""
 
-    STATUS_COLORS = {
-        'done': '#16A34A',
-        'partial': '#D97706',
-        'pending': '#5F687C',
+    # status -> theme token of its dot
+    STATUS_TOKENS = {
+        'done': 'success',
+        'partial': 'warning',
+        'pending': 'text_muted',
     }
 
     def __init__(self, doc_id: int, filename: str, status: str = 'done',
-                 parent: Optional[QWidget] = None):
+                 parent: Optional[QWidget] = None, meta: Optional[dict] = None):
         super().__init__(parent)
         self._doc_id = doc_id
         self._status = status
         self._filename = filename
+        meta = meta or {}
+        so_hieu = (meta.get('so_hieu') or '').strip()
+        self._title = so_hieu or filename
         self.setAttribute(Qt.WA_StyledBackground, False)
 
         row = QHBoxLayout(self)
-        row.setContentsMargins(10, 6, 10, 6)
-        row.setSpacing(10)
+        row.setContentsMargins(10, 5, 10, 5)
+        row.setSpacing(8)
 
         self._dot = _DotWidget(status)
-        row.addWidget(self._dot)
-
-        self._stt = QLabel(f"{doc_id:03d}")
-        stt_font = QFont("Consolas, 'Courier New', monospace")
-        stt_font.setPointSize(9)
-        self._stt.setFont(stt_font)
-        self._stt.setFixedWidth(36)
-        row.addWidget(self._stt)
+        row.addWidget(self._dot, 0, Qt.AlignVCenter)
 
         self._name = QLabel()
-        self._name.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        name_font = QFont("Be Vietnam Pro, Segoe UI")
-        name_font.setPointSize(10)
-        self._name.setFont(name_font)
-        self._name.setText(self._elide(filename, 160))
+        self._name.setObjectName("doc_row_title")
+        # A number is the document's own name; a file name is a stand-in.
+        self._name.setProperty("kind", "number" if so_hieu else "file")
+        self._name.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         row.addWidget(self._name, stretch=1)
-        # Apply theme colors now + on future theme changes.
-        self._apply_text_colors()
+
+        self._date = QLabel(_short_date(meta.get('issued', '')))
+        self._date.setObjectName("doc_row_date")
+        self._date.setVisible(bool(self._date.text()))
+        row.addWidget(self._date, 0, Qt.AlignVCenter)
 
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.setMinimumHeight(32)
+        self.setMinimumHeight(28)
+        self._elide()
 
-    def _elide(self, text: str, width: int) -> str:
-        return QFontMetrics(self._name.font()).elidedText(
-            text, Qt.ElideMiddle, max(48, width)
-        )
+    def _elide(self) -> None:
+        """Fit the title into what the date leaves: a number keeps its start,
+        a file name its start and its extension. In a narrow panel the date
+        gives way to the title (it is in the tooltip too)."""
+        self._name.ensurePolished()
+        self._date.ensurePolished()
+        names = QFontMetrics(self._name.font())
+        spare = self.width() - 10 - 10 - 9 - 8
+        date_width = QFontMetrics(self._date.font()).horizontalAdvance(self._date.text()) + 8
+        show_date = bool(self._date.text()) and (
+            names.horizontalAdvance(self._title) <= spare - date_width or spare >= 200)
+        self._date.setVisible(show_date)
+        if show_date:
+            spare -= date_width
+        mode = Qt.ElideMiddle if self._name.property("kind") == "file" else Qt.ElideRight
+        self._name.setText(names.elidedText(self._title, mode, max(48, spare)))
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self._name.setText(self._elide(self._filename, self.width() - 88))
-
-    def _apply_text_colors(self) -> None:
-        """Apply theme-appropriate text colors. Re-callable on theme change."""
-        try:
-            from theme_manager_v2 import ThemeManager
-            is_dark = ThemeManager.instance().is_dark
-        except Exception:
-            is_dark = False
-        if is_dark:
-            self._stt.setStyleSheet("color: #A8B2D1;")
-            self._name.setStyleSheet("color: #E8EBF5;")
-        else:
-            self._stt.setStyleSheet("color: #6B7280;")
-            self._name.setStyleSheet("color: #17231B;")
+        self._elide()
 
     def apply_theme(self, name: str) -> None:
-        """Public hook for ThemeManager.theme_changed signal."""
-        self._apply_text_colors()
+        """Public hook for ThemeManager.theme_changed: the stylesheet colours
+        the labels; the painted dot reads its token again."""
+        self._dot.update()
+        self._elide()
 
     @property
     def doc_id(self) -> int:
@@ -119,110 +140,109 @@ class DocumentRow(QWidget):
 
 
 class _DotWidget(QWidget):
-    """Status indicator — 3 shapes: filled/half/ring + tooltip."""
+    """Status: filled (done), half (partial), ring (pending), 7px, in the
+    success / warning / muted token of the current theme. Its meaning is
+    in the row tooltip."""
 
-    STATUS_LABELS = {
-        'done':    'Đã OCR đầy đủ',
-        'partial': 'OCR chưa đủ (văn bản ngắn)',
-        'pending': 'Chưa OCR',
-    }
+    STATUS_LABELS = STATUS_LABELS
 
     def __init__(self, status: str, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self._status = status
-        self._color = QColor(DocumentRow.STATUS_COLORS.get(status, '#5F687C'))
-        self.setFixedSize(12, 12)
-        self.setToolTip(self.STATUS_LABELS.get(status, ''))
+        self.setFixedSize(9, 9)
 
     def set_status(self, status: str) -> None:
         self._status = status
-        self._color = QColor(DocumentRow.STATUS_COLORS.get(status, '#5F687C'))
-        self.setToolTip(self.STATUS_LABELS.get(status, ''))
         self.update()
 
     def paintEvent(self, _event):
+        token = DocumentRow.STATUS_TOKENS.get(self._status, 'text_muted')
+        color = QColor(_theme_tokens()[token])
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         if self._status == 'done':
-            p.setBrush(self._color)
+            p.setBrush(color)
             p.setPen(Qt.NoPen)
-            p.drawEllipse(1, 1, 10, 10)
+            p.drawEllipse(1, 1, 7, 7)
         elif self._status == 'partial':
-            pen = QPen(self._color, 1.4)
-            p.setPen(pen)
+            p.setPen(QPen(color, 1.2))
             p.setBrush(Qt.NoBrush)
-            p.drawEllipse(1, 1, 10, 10)
+            p.drawEllipse(1, 1, 7, 7)
             p.setPen(Qt.NoPen)
-            p.setBrush(self._color)
-            p.drawChord(1, 1, 10, 10, -90 * 16, 180 * 16)
+            p.setBrush(color)
+            p.drawChord(1, 1, 7, 7, -90 * 16, 180 * 16)
         else:
-            pen = QPen(self._color, 1.4)
-            p.setPen(pen)
+            p.setPen(QPen(color, 1.2))
             p.setBrush(Qt.NoBrush)
-            p.drawEllipse(1, 1, 10, 10)
+            p.drawEllipse(1, 1, 7, 7)
         p.end()
+
+
+def _short_date(value: str) -> str:
+    """The issue date as stored (dd/mm/yyyy); anything long is left out."""
+    value = (value or "").strip()
+    return value if 0 < len(value) <= 10 else ""
 
 
 # ── Tooltip HTML builder ───────────────────────────────────────────
 def build_tooltip_html(so_hieu: str, loai_vb: str, nd_chinh: str,
-                       pages: int = 0, filename: str = "") -> str:
-    """Rich HTML for QListWidgetItem.setToolTip().
+                       pages: int = 0, filename: str = "", issued: str = "",
+                       status: str = "", theme: Optional[str] = None) -> str:
+    """Rich HTML for QListWidgetItem.setToolTip(), in the theme's colours.
 
-    Layout (user spec 2026-04-18 v5):
-        Line 1:  <b>Số hiệu</b>  <i>N trang</i>    (10pt / 9pt)
-        Line 2:  Nội dung chính — full, Qt auto-wraps    (9pt regular)
+        336/KH-KTNS                       (bold, sans)
+        Kế hoạch, ban hành 02/08/2017, 4 trang     (secondary)
+        Trích yếu / nội dung chính        (Times New Roman: document text)
+        Đã OCR đầy đủ   01.01.52.441.03.pdf        (muted)
 
-    Size calibration: user reported previous 11-12pt felt "too big" on
-    their HiDPI display → shrunk to 9-10pt range. Qt tooltip auto-wraps
-    long text naturally; removed character truncation so long ND chính
-    documents show the full content.
+    The tooltip's background and text colour come from the QToolTip rule
+    of the theme stylesheet; the secondary and muted colours here come from
+    the same tokens, so the tooltip reads in light and dark. ND chính is
+    capped at 1500 characters for speed; Qt wraps it.
     """
+    tokens = _theme_tokens(theme)
+
     def esc(s: str) -> str:
         return html_lib.escape(s or "", quote=False)
 
     so = (so_hieu or "").strip()
     nd = (nd_chinh or "").strip()
+    sans = "'Be Vietnam Pro', 'Segoe UI', sans-serif"
+    paper = "'Times New Roman', serif"
 
-    # Elegant font stack — prioritises serif for classic official look.
-    ff = "'Cambria', 'Be Vietnam Pro', 'Segoe UI', serif"
+    parts = [
+        f"<p style=\"margin:0; font-family:{sans}; font-size:10pt; font-weight:600;\">"
+        f"{esc(so or filename or '(không tên)')}</p>"
+    ]
 
-    parts = []
-
-    # Line 1: Số hiệu (bold) + Số trang (italic, muted), same line.
-    line1_bits = []
-    if so:
-        line1_bits.append(
-            f"<b style=\"color:#0F2B5B; font-size:10pt;\">{esc(so)}</b>"
-        )
-    else:
-        line1_bits.append(
-            "<span style=\"color:#5F687C; font-style:italic; font-size:10pt;\">"
-            "(Chưa có số hiệu)</span>"
-        )
+    details = [loai_vb.strip() if loai_vb else ""]
+    if _short_date(issued):
+        details.append(f"ban hành {_short_date(issued)}")
     if pages and pages > 0:
-        line1_bits.append(
-            f"<i style=\"color:#6B7280; font-size:9pt;\">{pages} trang</i>"
+        details.append(f"{pages} trang")
+    details = [d for d in details if d]
+    if details:
+        parts.append(
+            f"<p style=\"margin:2px 0 0 0; font-family:{sans}; font-size:9pt;"
+            f" color:{tokens['text_secondary']};\">{esc(', '.join(details))}</p>"
         )
 
-    parts.append(
-        f"<p style=\"margin:0 0 3px 0; font-family:{ff};\">"
-        + "&nbsp;&nbsp;".join(line1_bits)
-        + "</p>"
-    )
-
-    # Line 2: Nội dung chính — no truncation, let Qt wrap naturally.
-    # Cap only for memory safety: 1500 chars still renders fast.
     if nd:
         nd_show = nd if len(nd) <= 1500 else nd[:1497] + "..."
         parts.append(
-            f"<p style=\"margin:0; font-family:{ff}; font-size:9pt;"
-            f" color:#374151; font-weight:normal;\">"
+            f"<p style=\"margin:6px 0 0 0; font-family:{paper}; font-size:10.5pt;\">"
             f"{esc(nd_show)}</p>"
         )
-    elif not so:
+
+    footer = [STATUS_LABELS.get(status, "")]
+    if so and filename:
+        footer.append(filename)
+    footer = [f for f in footer if f]
+    if footer:
         parts.append(
-            f"<p style=\"margin:0; font-family:{ff}; font-size:8.5pt;"
-            f" color:#5F687C; font-style:italic;\">{esc(filename)}</p>"
+            f"<p style=\"margin:6px 0 0 0; font-family:{sans}; font-size:8.5pt;"
+            f" color:{tokens['text_muted']};\">"
+            + "&nbsp;&nbsp;&nbsp;".join(esc(f) for f in footer) + "</p>"
         )
 
     return "".join(parts)
@@ -236,7 +256,9 @@ class DocumentListWidget(QListWidget):
         Qt.UserRole       → doc_id (int)
         Qt.UserRole + 1   → stats dict
         Qt.UserRole + 2   → meta dict (so_hieu, nd_chinh, pages, urgency,
-                                       size_mb, path, filename, loai_vb)
+                                       size_mb, path, filename, loai_vb,
+                                       issued)
+        Qt.UserRole + 3   → status ('done' | 'partial' | 'pending')
     """
 
     doc_clicked = pyqtSignal(int)
@@ -247,12 +269,14 @@ class DocumentListWidget(QListWidget):
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
+        self.setObjectName("library_list")
         self.setMouseTracking(True)
         self.viewport().setMouseTracking(True)
         self.setSelectionMode(QListWidget.ExtendedSelection)
         self.setAlternatingRowColors(False)
         self.setUniformItemSizes(False)
-        self.setSpacing(1)
+        self.setSpacing(0)
+        self.setFrameShape(QListWidget.NoFrame)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -262,48 +286,16 @@ class DocumentListWidget(QListWidget):
         # Qt native setToolTip() handles actual tooltip display.
         self.itemEntered.connect(self._on_item_entered)
 
-        self._apply_list_style()
-
         self._lazy_loaded: set = set()
 
-    def _apply_list_style(self) -> None:
-        """Apply theme to list widget itself (background + selection)."""
-        try:
-            from theme_manager_v2 import ThemeManager
-            is_dark = ThemeManager.instance().is_dark
-        except Exception:
-            is_dark = False
-        if is_dark:
-            self.setStyleSheet("""
-                QListWidget {
-                    background: #0F1419;
-                    color: #E8EBF5;
-                    border: 1px solid #2D3B52;
-                    border-radius: 6px;
-                    outline: 0;
-                }
-                QListWidget::item { border: none; border-radius: 4px; }
-                QListWidget::item:hover { background: #1E2B3D; }
-                QListWidget::item:selected { background: #4A6B52; color: #E8EBF5; }
-            """)
-        else:
-            self.setStyleSheet("""
-                QListWidget {
-                    background: #FFFEFA;
-                    border: 1px solid #D8D1C3;
-                    border-radius: 6px;
-                    outline: 0;
-                }
-                QListWidget::item { border: none; border-radius: 4px; }
-                QListWidget::item:hover { background: #F5F4EE; }
-                QListWidget::item:selected { background: #E6EDE8; color: #24432D; }
-            """)
-
     def apply_theme(self, name: str) -> None:
-        """Public hook — refresh list style + all row widgets."""
-        self._apply_list_style()
+        """Public hook — rebuild the tooltips in the new theme's colours and
+        repaint the rows (their labels follow the stylesheet)."""
         for i in range(self.count()):
             item = self.item(i)
+            meta = item.data(Qt.UserRole + 2) or {}
+            item.setToolTip(self._build_tooltip_for(
+                meta, meta.get('filename', ''), item.data(Qt.UserRole + 3) or '', name))
             widget = self.itemWidget(item)
             if widget and hasattr(widget, 'apply_theme'):
                 widget.apply_theme(name)
@@ -312,13 +304,14 @@ class DocumentListWidget(QListWidget):
     def add_document(self, doc_id: int, filename: str, status: str,
                      stats: dict, meta: dict) -> None:
         """Append a document row. Tooltip built from meta dict."""
-        row = DocumentRow(doc_id, filename, status)
+        row = DocumentRow(doc_id, filename, status, meta=meta or {})
         item = QListWidgetItem()
         item.setSizeHint(row.sizeHint())
         item.setData(Qt.UserRole, doc_id)
         item.setData(Qt.UserRole + 1, stats or {})
         item.setData(Qt.UserRole + 2, meta or {})
-        item.setToolTip(self._build_tooltip_for(meta or {}, filename))
+        item.setData(Qt.UserRole + 3, status)
+        item.setToolTip(self._build_tooltip_for(meta or {}, filename, status))
         self.addItem(item)
         self.setItemWidget(item, row)
 
@@ -330,14 +323,16 @@ class DocumentListWidget(QListWidget):
                 existing = it.data(Qt.UserRole + 2) or {}
                 existing.update(meta_patch or {})
                 it.setData(Qt.UserRole + 2, existing)
-                filename = existing.get('filename', '')
-                it.setToolTip(self._build_tooltip_for(existing, filename))
                 # Re-classify status if patch included a status hint.
                 status = meta_patch.get('_reclassify_status')
                 if status:
+                    it.setData(Qt.UserRole + 3, status)
                     widget = self.itemWidget(it)
                     if isinstance(widget, DocumentRow):
                         widget.set_status(status)
+                filename = existing.get('filename', '')
+                it.setToolTip(self._build_tooltip_for(
+                    existing, filename, it.data(Qt.UserRole + 3) or ''))
                 break
 
     def selected_doc_ids(self) -> list[int]:
@@ -357,13 +352,17 @@ class DocumentListWidget(QListWidget):
         return False
 
     # ── Internal ─────────────────────────────────────────────────
-    def _build_tooltip_for(self, meta: dict, filename: str) -> str:
+    def _build_tooltip_for(self, meta: dict, filename: str, status: str = '',
+                           theme: Optional[str] = None) -> str:
         return build_tooltip_html(
             so_hieu=meta.get('so_hieu', ''),
             loai_vb=meta.get('loai_vb', ''),
             nd_chinh=meta.get('nd_chinh', ''),
             pages=int(meta.get('pages', 0) or 0),
             filename=filename or meta.get('filename', ''),
+            issued=meta.get('issued', ''),
+            status=status,
+            theme=theme,
         )
 
     def _on_item_entered(self, item: QListWidgetItem) -> None:
@@ -410,29 +409,3 @@ def classify_status(doc_tuple, van_ban_text: str = "") -> str:
     if not text.strip():
         return 'pending'
     return 'done' if len(text) >= 300 else 'partial'
-
-
-# Global QToolTip stylesheet — light theme matching the app.
-# Apply once at app startup:
-#     from doc_list_widget import apply_tooltip_style
-#     apply_tooltip_style(app)
-BRAND_TOOLTIP_QSS = """
-QToolTip {
-    background-color: #FFFAEA;
-    color: #24432D;
-    border: 1px solid #846314;
-    border-radius: 6px;
-    padding: 8px 10px;
-    font-family: 'Cambria', 'Be Vietnam Pro', 'Segoe UI', serif;
-    font-size: 9pt;
-    opacity: 240;
-}
-"""
-
-
-def apply_tooltip_style(app) -> None:
-    """Append the brand tooltip stylesheet to the app's existing style."""
-    current = app.styleSheet() or ""
-    if "QToolTip {" in current:
-        return  # already applied
-    app.setStyleSheet(current + "\n" + BRAND_TOOLTIP_QSS)

@@ -265,17 +265,12 @@ class DocumentDatabase:
             chat_history.init_tables(cursor)
 
             # AI Search v2: sqlite-vec KNN, tự fallback NumPy khi extension lỗi.
+            # Rebuild whenever chunk_vectors does not mirror document_chunks
+            # (ids, not just counts): databases written before chunk writes
+            # kept the index in sync carry unindexed chunks and orphan vectors.
             import vector_index
             if vector_index.init_vec(conn):
-                vector_count = cursor.execute(
-                    "SELECT count(*) FROM chunk_vectors"
-                ).fetchone()[0]
-                embedding_count = cursor.execute(
-                    "SELECT count(*) FROM document_chunks "
-                    "WHERE embedding IS NOT NULL"
-                ).fetchone()[0]
-                if embedding_count and not vector_count:
-                    vector_index.VectorIndex(conn).sync_from_chunks(conn)
+                vector_index.VectorIndex(conn).ensure_synced(conn)
 
             conn.commit()
 
@@ -489,21 +484,7 @@ class DocumentDatabase:
             if existing_id:
                 logger.info(f"Document {existing_id} exists, replacing OCR results with model {model_key}")
                 # Tạo version mới với kết quả OCR mới thay vì bỏ qua
-                updates = {
-                    'cqbh_tren': ocr_results.get('CQBH_tren', ''),
-                    'cqbh_duoi': ocr_results.get('CQBH_duoi', ''),
-                    'so_ki_hieu': ocr_results.get('So_Ki_Hieu', ''),
-                    'loai_vb': ocr_results.get('Loai_VB', ''),
-                    'nd_chinh': ocr_results.get('ND_Chinh', ''),
-                    'ngay_bh': ocr_results.get('Ngay_BH', ''),
-                    'noi_nhan': ocr_results.get('Noi_Nhan', ''),
-                    'chuc_vu': ocr_results.get('Chuc_Vu', ''),
-                    'chu_ky': ocr_results.get('Chu_Ky', ''),
-                    'do_khan': ocr_results.get('Do_Khan', 'Không'),
-                    'do_mat': ocr_results.get('Do_Mat', ''),
-                    'van_ban_dang_txt': ocr_results.get('Van_ban_dang_txt', ''),
-                }
-                self.create_new_version(existing_id, updates, modified_by=f"OCR ({model_key})")
+                self.replace_ocr_result(existing_id, ocr_results, model_key)
                 return existing_id
             
             if page_count is None:
@@ -578,6 +559,34 @@ class DocumentDatabase:
             logger.error(f"Error adding document: {str(e)}")
             raise
     
+    def replace_ocr_result(self, doc_id: int, ocr_results: Dict[str, Any],
+                           model_key: str = "chandra-q4",
+                           modified_by_suffix: str = ""):
+        """Store a fresh OCR result of an existing document as a new version.
+
+        Returns the new version number. The caller re-indexes the document
+        (chunks, vectors, legal graph) afterwards.
+        """
+        updates = {
+            'cqbh_tren': ocr_results.get('CQBH_tren', ''),
+            'cqbh_duoi': ocr_results.get('CQBH_duoi', ''),
+            'so_ki_hieu': ocr_results.get('So_Ki_Hieu', ''),
+            'loai_vb': ocr_results.get('Loai_VB', ''),
+            'nd_chinh': ocr_results.get('ND_Chinh', ''),
+            'ngay_bh': ocr_results.get('Ngay_BH', ''),
+            'noi_nhan': ocr_results.get('Noi_Nhan', ''),
+            'chuc_vu': ocr_results.get('Chuc_Vu', ''),
+            'chu_ky': ocr_results.get('Chu_Ky', ''),
+            'do_khan': ocr_results.get('Do_Khan', 'Không'),
+            'do_mat': ocr_results.get('Do_Mat', ''),
+            'van_ban_dang_txt': ocr_results.get('Van_ban_dang_txt', ''),
+        }
+        # create_new_version reads model_used from the trailing "(...)".
+        label = f"OCR {modified_by_suffix}".strip()
+        return self.create_new_version(
+            doc_id, updates, modified_by=f"{label} ({model_key})"
+        )
+
     def _calculate_file_hash(self, file_path: str) -> str:
         """Calculate SHA-256 hash of a file for deduplication"""
         import hashlib

@@ -32,14 +32,14 @@ class WorkspaceLayoutTests(unittest.TestCase):
         self.assertIn("show_error_state", source)
         self.assertNotIn('f"📄 {short}', source)
 
-    def test_workspace_uses_only_bundled_lucide_icons(self):
+    def test_workspace_uses_only_bundled_fluent_icons(self):
         sources = "\n".join(
             (ROOT / name).read_text(encoding="utf-8-sig")
             for name in ("main_window_1.py", "chat_panel.py")
         )
         self.assertNotIn("QIcon.fromTheme", sources)
         names = set(re.findall(r'\bicon\(\s*["\']([^"\']+)', sources))
-        missing = [name for name in names if not (ROOT / "icons" / "lucide" / f"{name}.svg").is_file()]
+        missing = [name for name in names if not (ROOT / "icons" / "fluent" / f"{name}.svg").is_file()]
         self.assertEqual([], missing)
 
     def test_document_list_elides_long_names_without_horizontal_scroll(self):

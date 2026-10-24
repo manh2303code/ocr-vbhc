@@ -3,7 +3,10 @@
 from dataclasses import dataclass, replace
 from typing import Dict, List, Optional
 
-from search_store import fts_search
+from search_store import best_passage, fts_search, fts_search_folded
+
+# The reranker reads at most 500 characters of each candidate (reranker.py).
+RERANK_PASSAGE_CHARS = 480
 
 
 @dataclass(frozen=True)
@@ -43,6 +46,9 @@ def hybrid_search(
 
     query_vector = embedding_model.encode(query)
     fts_hits = fts_search(conn, query, top_n=50, doc_ids=doc_ids)
+    # Accent-insensitive list: questions typed without marks, and OCR text
+    # whose marks are wrong, still meet.
+    folded_hits = fts_search_folded(conn, query, top_n=50, doc_ids=doc_ids)
     vector_hits = (
         vindex.search(conn, query_vector, top_n=50, doc_ids=doc_ids)
         if query_vector is not None
@@ -51,6 +57,7 @@ def hybrid_search(
     scores = rrf_fuse([
         [hit[0] for hit in fts_hits],
         [hit[0] for hit in vector_hits],
+        [hit[0] for hit in folded_hits],
     ])
     if not scores:
         return []
@@ -93,7 +100,12 @@ def hybrid_search(
     )
     if can_rerank:
         prefix = chunks[:rerank_top]
-        rerank_scores = reranker.rerank(query, [chunk.chunk_text for chunk in prefix])
+        # Score the part of each chunk the question is about, not its first
+        # 500 characters: an answer two thirds down a chunk used to be invisible.
+        rerank_scores = reranker.rerank(
+            query,
+            [best_passage(chunk.chunk_text, query, RERANK_PASSAGE_CHARS) for chunk in prefix],
+        )
         reranked = [
             replace(chunk, score=float(score))
             for chunk, score in zip(prefix, rerank_scores)

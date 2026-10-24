@@ -13,7 +13,7 @@ class CommandSpec:
 
 
 COMMANDS = (
-    CommandSpec("home", "Bàn bắt đầu việc", "Điều hướng", "Alt+H", "house"),
+    CommandSpec("home", "Bàn bắt đầu việc", "Điều hướng", "Alt+H", "app-mark-solid"),
     CommandSpec("add_file", "Thêm một văn bản", "Tệp", "Ctrl+O", "file-plus", "Quét một văn bản"),
     CommandSpec("add_files", "Thêm nhiều tệp", "Tệp", "Ctrl+Shift+O", "files"),
     CommandSpec("add_folder", "Nhập thư mục văn bản", "Tệp", "Ctrl+Alt+O", "folder-open"),
@@ -22,12 +22,12 @@ COMMANDS = (
     CommandSpec("delete", "Xóa văn bản", "Chỉnh sửa", "Del", "trash-2"),
     CommandSpec("search", "Tìm kiếm văn bản", "Tìm kiếm", "Ctrl+F", "search"),
     CommandSpec("ai_search", "Tìm kiếm AI ngữ nghĩa", "Tìm kiếm", "Ctrl+Shift+F", "sparkles"),
-    CommandSpec("chat", "Mở trợ lý pháp luật", "Tìm kiếm", "Ctrl+Shift+K", "panel-right", "Hỏi trợ lý pháp luật"),
+    CommandSpec("chat", "Mở trợ lý pháp luật", "Tìm kiếm", "Ctrl+Shift+K", "chat", "Hỏi trợ lý pháp luật"),
     CommandSpec("analytics", "Phân tích thống kê", "Báo cáo", "Ctrl+Shift+A", "bar-chart-3"),
-    CommandSpec("export_excel", "Xuất dữ liệu Excel", "Báo cáo", "Ctrl+E", "archive"),
+    CommandSpec("export_excel", "Xuất dữ liệu Excel", "Báo cáo", "Ctrl+E", "excel"),
     CommandSpec("toggle_theme", "Đổi chế độ sáng/tối", "Hiển thị", "Ctrl+D", "moon"),
     CommandSpec("toggle_library", "Ẩn/hiện kho văn bản", "Hiển thị", "F9", "panel-left", "Mở kho văn bản"),
-    CommandSpec("toggle_metadata", "Ẩn/hiện metadata", "Hiển thị", "F10", "panel-right"),
+    CommandSpec("toggle_metadata", "Ẩn/hiện vùng chi tiết", "Hiển thị", "F10", "panel-right"),
     CommandSpec("preview", "Xem trước PDF", "Hiển thị", "Ctrl+P", "eye"),
     CommandSpec("refresh", "Làm mới dữ liệu", "Hiển thị", "F5", "refresh-cw"),
     CommandSpec("settings", "Mở cài đặt", "Hiển thị", "Ctrl+,", "settings"),

@@ -143,6 +143,42 @@ class HybridTests(unittest.TestCase):
             (1, "12/QĐ-UBND", 2),
         )
 
+    def test_unaccented_query_still_finds_the_chunk(self):
+        conn = self._db()
+        from vector_index import VectorIndex
+
+        class _NoVector(_FakeEmbed):
+            def encode(self, _text):
+                return None
+
+        vindex = VectorIndex(conn, force_fallback=True)
+        vindex.sync_from_chunks(conn)
+        out = hybrid_search(conn, vindex, _NoVector(), None, "ho chieu", top_k=5)
+
+        self.assertEqual([chunk.doc_id for chunk in out], [1])
+
+    def test_reranker_reads_the_part_of_the_chunk_the_question_is_about(self):
+        conn = self._db()
+        long_text = ("Phần mở đầu chung. " * 80) + "Hạn nộp hồ sơ hộ chiếu là ngày 30/4." + (" Phụ lục." * 60)
+        conn.execute("UPDATE document_chunks SET chunk_text = ? WHERE id = 1", (long_text,))
+        conn.commit()
+        from vector_index import VectorIndex
+
+        seen = []
+
+        class _Recorder(_FakeReranker):
+            def rerank(self, query, texts):
+                seen.extend(texts)
+                return super().rerank(query, texts)
+
+        vindex = VectorIndex(conn, force_fallback=True)
+        vindex.sync_from_chunks(conn)
+        hybrid_search(conn, vindex, _FakeEmbed(), _Recorder(), "hạn nộp hồ sơ hộ chiếu", top_k=5)
+
+        self.assertTrue(seen)
+        self.assertIn("30/4", seen[0])
+        self.assertLessEqual(len(seen[0]), 500)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,8 +9,11 @@ application starts either way and only degrades silently at query time. Nor was
 there any way to move 16 GB at all — a single archive exceeds the 2 GiB release
 asset ceiling that release_bundle.split_file exists to work around.
 """
+import io
 import json
+import os
 import shutil
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -406,6 +409,154 @@ class UnsafeMemberTests(unittest.TestCase):
             rejected,
         )
 
+    def test_regular_file_and_directory_members_are_accepted(self):
+        self.assertEqual(
+            [],
+            build_asset_bundle.unsafe_members([
+                _member("gguf", kind=tarfile.DIRTYPE),
+                _member("gguf/chat/model.gguf", b"weights"),
+            ]),
+        )
+
+    def test_link_members_are_rejected_whatever_their_name(self):
+        """A link's name stays inside the destination; its target need not."""
+        rejected = build_asset_bundle.unsafe_members([
+            _member("gguf/ok.bin", b"ok"),
+            _member("gguf/hard", kind=tarfile.LNKTYPE, linkname="../outside.txt"),
+            _member("gguf/soft", kind=tarfile.SYMTYPE, linkname="gguf/ok.bin"),
+            _member("gguf/fifo", kind=tarfile.FIFOTYPE),
+            _member("../escape.bin", b"x"),
+        ])
+
+        self.assertEqual(
+            ["gguf/hard", "gguf/soft", "gguf/fifo", "../escape.bin"], rejected
+        )
+
+
+class PlainFileNameTests(unittest.TestCase):
+    """ASSET_MANIFEST.json rides on the same USB stick as the parts."""
+
+    def test_names_pack_actually_writes_are_plain(self):
+        for name in ("assets.tar", "assets.tar.gz", "assets.tar.part001"):
+            with self.subTest(name=name):
+                self.assertTrue(build_asset_bundle.is_plain_file_name(name))
+
+    def test_names_that_point_elsewhere_are_not(self):
+        for name in ("", ".", "..", "../evil.tar", "..\\evil.tar", "sub/assets.tar",
+                     "/abs/assets.tar", "C:assets.tar", "C:\\assets.tar",
+                     "assets..tar", None, 7):
+            with self.subTest(name=name):
+                self.assertFalse(build_asset_bundle.is_plain_file_name(name))
+
+
+def _member(name, payload=None, kind=tarfile.REGTYPE, linkname=""):
+    info = tarfile.TarInfo(name)
+    info.type = kind
+    info.linkname = linkname
+    info.mode = 0o755 if kind == tarfile.DIRTYPE else 0o644
+    if payload is not None:
+        info.size = len(payload)
+    return info
+
+
+class HostileBundleTests(AssetBundleTestCase):
+    """SHA256SUMS and the manifest travel with the parts, so they prove only
+    that the transfer is intact — never that whoever cut the bundle meant well.
+    Every forged bundle below verifies clean; restore has to refuse it anyway.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # One level deeper than the bundle, so a name that climbs two levels
+        # out of the join directory still lands inside this test's tmp dir.
+        self.destination = self.root / "target" / "restored"
+        self.outside = self.root / "target" / "outside.txt"
+        self.outside.parent.mkdir(parents=True)
+        self.outside.write_text("original", encoding="utf-8")
+
+    def forge(self, members, archive_name=None):
+        """Re-cut a packed bundle around a hand-built archive."""
+        manifest = self.pack()
+        for part in manifest["parts"]:
+            (self.bundle / part["name"]).unlink()
+
+        archive = self.root / manifest["archive"]["name"]
+        with tarfile.open(str(archive), "w", format=tarfile.PAX_FORMAT) as tar:
+            for info, payload in members:
+                tar.addfile(info, None if payload is None else io.BytesIO(payload))
+        parts = release_bundle.split_file(archive, self.bundle, limit=512)
+        release_bundle.write_checksums(
+            parts, self.bundle / release_bundle.CHECKSUM_NAME
+        )
+        manifest["archive"].update(
+            bytes=archive.stat().st_size,
+            sha256=release_bundle.sha256_file(archive),
+        )
+        if archive_name is not None:
+            manifest["archive"]["name"] = archive_name
+        manifest["parts"] = [
+            {"index": index, "name": part.name, "bytes": part.stat().st_size,
+             "sha256": release_bundle.sha256_file(part)}
+            for index, part in enumerate(parts, start=1)
+        ]
+        archive.unlink()
+        build_asset_bundle.write_asset_manifest(self.bundle, manifest)
+        return manifest
+
+    def assertRefusedBeforeExtraction(self):
+        with self.assertRaises(build_asset_bundle.BundleIntegrityError) as caught:
+            build_asset_bundle.restore_assets(self.bundle, self.destination)
+        self.assertEqual("original", self.outside.read_text(encoding="utf-8"))
+        self.assertFalse((self.destination / "gguf").exists())
+        return caught.exception
+
+    def test_a_hard_link_then_a_file_of_the_same_name_cannot_overwrite_outside(self):
+        """Extracting the file opens the link for writing, i.e. outside.txt."""
+        self.forge([
+            (_member("gguf", kind=tarfile.DIRTYPE), None),
+            (_member("gguf/x", kind=tarfile.LNKTYPE, linkname="../outside.txt"), None),
+            (_member("gguf/x", b"pwned"), b"pwned"),
+        ])
+
+        error = self.assertRefusedBeforeExtraction()
+        self.assertIn("gguf/x", str(error))
+
+    def test_a_symlink_out_of_the_destination_cannot_be_written_through(self):
+        self.forge([
+            (_member("gguf", kind=tarfile.DIRTYPE), None),
+            (_member("gguf/link", kind=tarfile.SYMTYPE, linkname="../.."), None),
+            (_member("gguf/link/evil", b"pwned"), b"pwned"),
+        ])
+
+        error = self.assertRefusedBeforeExtraction()
+        self.assertIn("gguf/link", str(error))
+        self.assertFalse((self.outside.parent / "evil").exists())
+
+    def test_an_archive_name_that_climbs_out_of_the_join_directory_is_refused(self):
+        # restore joins into <destination.parent>/asset-join-*/<archive name>.
+        self.forge(
+            [(_member("gguf", kind=tarfile.DIRTYPE), None),
+             (_member("gguf/ok.bin", b"ok"), b"ok")],
+            archive_name="../../evil.tar",
+        )
+
+        error = self.assertRefusedBeforeExtraction()
+        self.assertIn("../../evil.tar", str(error))
+        self.assertFalse((self.root / "evil.tar").exists())
+
+    def test_verify_names_a_manifest_file_name_that_is_not_plain(self):
+        manifest = self.forge([(_member("gguf/ok.bin", b"ok"), b"ok")])
+        manifest["parts"][0]["name"] = "../" + manifest["parts"][0]["name"]
+        build_asset_bundle.write_asset_manifest(self.bundle, manifest)
+
+        problems = build_asset_bundle.verify_bundle(self.bundle)
+
+        self.assertTrue(
+            any(manifest["parts"][0]["name"] in p for p in problems), problems
+        )
+        with self.assertRaises(build_asset_bundle.BundleIntegrityError):
+            build_asset_bundle.restore_assets(self.bundle, self.destination)
+
 
 class BundleIntegrityTests(AssetBundleTestCase):
     def test_an_intact_bundle_verifies_clean(self):
@@ -462,6 +613,34 @@ class BundleIntegrityTests(AssetBundleTestCase):
                         (destination / relative).read_bytes(),
                         relative,
                     )
+
+    def test_hard_linked_source_files_are_packed_as_plain_files(self):
+        """restore refuses link members, so pack must never write one."""
+        original = self.source / "gguf" / "gguf.bin"
+        os.link(str(original), str(self.source / "gguf" / "copy.bin"))
+        self.pack()
+        destination = self.root / "restored"
+
+        build_asset_bundle.restore_assets(self.bundle, destination)
+
+        self.assertEqual(
+            original.read_bytes(), (destination / "gguf" / "copy.bin").read_bytes()
+        )
+
+    def test_symlinked_source_files_are_packed_as_their_content(self):
+        original = self.source / "gguf" / "gguf.bin"
+        try:
+            os.symlink(original.name, str(self.source / "gguf" / "alias.bin"))
+        except (OSError, NotImplementedError):
+            self.skipTest("creating a symlink needs extra privileges here")
+        self.pack()
+        destination = self.root / "restored"
+
+        build_asset_bundle.restore_assets(self.bundle, destination)
+
+        alias = destination / "gguf" / "alias.bin"
+        self.assertFalse(alias.is_symlink())
+        self.assertEqual(original.read_bytes(), alias.read_bytes())
 
     def test_restoring_refuses_a_corrupt_transfer(self):
         manifest = self.pack()

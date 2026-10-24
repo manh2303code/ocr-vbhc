@@ -110,8 +110,13 @@ def _detect_gpu() -> tuple:
 def calculate_optimal_workers(hw: HardwareInfo, model_vram_mb: int = 3500) -> int:
     """Calculate optimal number of parallel OCR workers.
 
+    The result is also the OCR server's slot count (-np), so each worker
+    owns a 12288-cell context (~384 MiB KV, Chandra 2 keeps KV on 8/32
+    layers only); see app_config.ocr_server_context_args.
+
     Factors:
-    - GPU VRAM: model + N × KV cache (~60MB per slot at ctx=8192 Q4)
+    - GPU VRAM: model + compute buffers (3286 MiB) + N × slot (434 MiB: 384 KV +
+      50 recurrent state; measured 3720 MiB for 1 slot, 4155 MiB for 2)
     - RAM: each worker needs ~200MB for image processing
     - CPU: need threads for HTTP streaming + image decoding
     - GPU compute: too many workers → per-worker slowdown
@@ -127,8 +132,8 @@ def calculate_optimal_workers(hw: HardwareInfo, model_vram_mb: int = 3500) -> in
         logger.info("CPU mode: 1 worker (no GPU parallelism; Chandra ~90s/page)")
         return 1
 
-    # llama-server manages KV cache internally (8192 MiB pool, ~50MB per slot).
-    # We don't need to check raw VRAM free — server handles allocation.
+    # KV per slot is small (see docstring); the 8192 MiB figure in old logs
+    # was llama-server's RAM prompt cache, now disabled (--cache-ram 0).
     # Key constraint is GPU compute bandwidth: more slots = slower per-slot.
 
     # Benchmark finding (RTX 4070 8GB, 2026-04-17):
@@ -143,7 +148,9 @@ def calculate_optimal_workers(hw: HardwareInfo, model_vram_mb: int = 3500) -> in
     #   ≤12GB: 1 worker (sequential faster — GPU compute saturated)
     #   16GB+: 2 workers (RTX 4080/A4000 — enough headroom)
     #   24GB+: 2 workers (3 concurrent VLM requests destabilized llama-server
-    #   on RTX 5090 Laptop during the 2026-07-13 three-page benchmark)
+    #   on RTX 5090 Laptop during the 2026-07-13 three-page benchmark; that
+    #   was 3 pages overflowing the then-shared 8192-cell KV pool. With one
+    #   slot per worker 3+ workers have not been re-measured yet.)
     #   48GB+: 4 workers (A6000, DGX, GB10)
     if hw.gpu_vram_total_mb >= 48000:
         max_by_gpu = 4

@@ -84,10 +84,13 @@ DARK_FILL_TOKENS = {
 
 class ThemeAccessibilityTests(unittest.TestCase):
     def test_light_tokens_match_the_landing(self):
-        self.assertEqual("#F5F1E8", COLORS["bg"])
-        self.assertEqual("#FFFEFA", COLORS["surface"])
-        self.assertEqual("#17231B", COLORS["text"])
-        self.assertEqual("#24432D", COLORS["primary"])
+        from pathlib import Path
+
+        styles = (Path(__file__).resolve().parents[1] / "frontend" / "landing"
+                  / "landing.css").read_text(encoding="utf-8").lower()
+        for variable, token in (("paper", "bg"), ("surface", "surface"),
+                                ("ink", "text"), ("olive", "primary")):
+            self.assertIn("--{}:{}".format(variable, COLORS[token].lower()), styles)
 
     def test_text_tokens_meet_aa_on_every_light_surface(self):
         failures = []

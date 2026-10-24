@@ -21,8 +21,20 @@ class ChatServerCommandTests(unittest.TestCase):
             "--cache-type-k", "q8_0", "--cache-type-v", "q8_0",
             "--flash-attn", "auto",
             "--chat-template-kwargs", '{"enable_thinking": false}',
+            "-np", "1", "--cache-ram", "1024",
             "-ngl", "99",
         ])
+
+    def test_one_slot_owns_the_whole_context_and_ram_cache_is_capped(self):
+        # One user: a single slot gets all n_ctx tokens instead of four
+        # slots sharing them, and the prompt cache stops at 1 GiB of RAM
+        # instead of the 8 GiB default (token_budget_audit.md §3.9).
+        command = build_chat_server_command(
+            Path("llama-server.exe"), Path("qwen.gguf"), 9998, "cpu", 8192, 8,
+        )
+
+        self.assertEqual(command[command.index("-np") + 1], "1")
+        self.assertEqual(command[command.index("--cache-ram") + 1], "1024")
 
     def test_cpu_command_disables_gpu_and_never_adds_mmproj(self):
         command = build_chat_server_command(
@@ -73,7 +85,8 @@ class ChatServerManagerTests(unittest.TestCase):
         wait.assert_called_once_with(7.5)
         command = popen.call_args.args[0]
         self.assertIn("--jinja", command)
-        self.assertEqual(command[command.index("-c") + 1], "8192")
+        self.assertEqual(command[command.index("-c") + 1], "16384")
+        self.assertEqual(manager.active_context_size, 16384)
         self.assertEqual(command[-2:], ["-ngl", "99"])
         self.assertEqual(popen.call_args.kwargs["stdout"], subprocess.DEVNULL)
 
@@ -98,8 +111,34 @@ class ChatServerManagerTests(unittest.TestCase):
         select_model.assert_not_called()
         self.assertEqual(manager.active_model_key, "qwen3-8b")
         command = popen.call_args.args[0]
-        self.assertEqual(command[command.index("-c") + 1], "4096")
+        self.assertEqual(command[command.index("-c") + 1], "8192")
+        self.assertEqual(manager.active_context_size, 8192)
         self.assertEqual(command[-2:], ["-ngl", "0"])
+
+    @patch("app_config.detect_vram_mb", return_value=24463)
+    @patch("chat_server_manager.get_llama_bin_dir", return_value=Path("bin/cuda"))
+    @patch("chat_server_manager.get_chat_model_path", return_value=Path("qwen.gguf"))
+    @patch("chat_server_manager.get_llama_server_exe", return_value=Path("llama-server.exe"))
+    @patch("chat_server_manager.subprocess.Popen")
+    def test_8b_context_is_16k_without_asking_the_gpu_again(self, popen, _exe, _model, _bin, vram):
+        process = MagicMock()
+        process.pid = 44
+        process.poll.return_value = None
+        popen.return_value = process
+        manager = ChatServerManager()
+
+        with patch("chat_server_manager.open", mock_open()), \
+                patch.object(manager, "_kill_zombies_on_port", return_value=0), \
+                patch.object(manager, "_wait_healthy", return_value=True):
+            manager.start_chat(model_key="qwen3-8b", backend="cuda")
+
+        command = popen.call_args.args[0]
+        self.assertEqual(command[command.index("-c") + 1], "16384")
+        self.assertEqual(manager.active_context_size, 16384)
+        vram.assert_not_called()
+
+    def test_context_size_is_unknown_until_started(self):
+        self.assertIsNone(ChatServerManager().active_context_size)
 
 
 if __name__ == "__main__":

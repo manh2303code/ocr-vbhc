@@ -1,15 +1,25 @@
-"""Hybrid landing window: local HTML/GSAP with a native Qt fallback."""
+"""Hybrid landing window: local HTML with a native Qt fallback."""
 from __future__ import annotations
 
 import json
 import logging
+from datetime import date, datetime
 from pathlib import Path
 
-from PyQt5.QtCore import QObject, QSettings, Qt, QUrl, pyqtSignal, pyqtSlot
-from PyQt5.QtGui import QPixmap
+from PyQt5.QtCore import QObject, Qt, QUrl, pyqtSignal, pyqtSlot
+from PyQt5.QtGui import QColor, QFont, QKeySequence, QPixmap
 from PyQt5.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QMainWindow, QPushButton, QVBoxLayout, QWidget,
+    QAbstractItemView, QFrame, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
+    QPushButton, QShortcut, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
+
+from theme_tokens import colors_for
+from landing_data import landing_commands
+
+try:  # icons are a nicety; the fallback must open without QtSvg
+    from ui_icons import icon as _icon
+except ImportError:
+    _icon = None
 
 try:
     from PyQt5.QtWebChannel import QWebChannel
@@ -49,6 +59,15 @@ class LandingBridge(QObject):
     @pyqtSlot(result=str)
     def getSnapshot(self):
         return json.dumps(self._snapshot_provider(), ensure_ascii=False)
+
+    def snapshot(self):
+        """The snapshot for Python callers (theme, fallback); never raises."""
+        try:
+            data = self._snapshot_provider()
+        except Exception:  # The home screen must open even on a broken database.
+            logger.exception("Landing snapshot failed")
+            return {}
+        return data if isinstance(data, dict) else {}
 
     @pyqtSlot(str, str)
     def requestAction(self, action, payload="{}"):
@@ -126,6 +145,9 @@ class LandingWindow(QMainWindow):
         profile.setHttpCacheType(profile.MemoryHttpCache)
         profile.downloadRequested.connect(lambda item: item.cancel())
         view.setPage(page)
+        # The canvas colour before the HTML paints: no white flash in dark mode.
+        theme = self._bridge.snapshot().get("theme")
+        page.setBackgroundColor(QColor(colors_for(theme)["bg"]))
 
         for attribute in (
             QWebEngineSettings.PluginsEnabled,
@@ -177,63 +199,321 @@ class LandingWindow(QMainWindow):
             self._fallback.set_error(message)
 
 
+def describe_stamp(value, today=None):
+    """("Hôm nay 09:12" | "Hôm qua 16:40" | "14/10/2026", "14/10/2026 09:12").
+
+    Mirrors describeStamp in landing.js; the snapshot sends local time.
+    """
+    text = str(value or "")
+    try:
+        moment = datetime.strptime(text[:16], "%Y-%m-%dT%H:%M")
+    except ValueError:
+        try:
+            day = datetime.strptime(text[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
+        except ValueError:
+            return text, text
+        return day, day
+    day, time = moment.strftime("%d/%m/%Y"), moment.strftime("%H:%M")
+    days = ((today or date.today()) - moment.date()).days
+    short = {0: "Hôm nay " + time, 1: "Hôm qua " + time}.get(days, day)
+    return short, "{} {}".format(day, time)
+
+
+def _group_digits(value):
+    try:
+        number = max(0, int(value or 0))
+    except (TypeError, ValueError):
+        number = 0
+    return "{:,}".format(number).replace(",", ".")
+
+
+# Status line wording, as on the page: label and tooltip per state.
+_MODEL_TEXT = {
+    "ocr": {
+        True: ("OCR sẵn sàng", "Mô hình nhận dạng Chandra đã có trên máy"),
+        False: ("Thiếu mô hình OCR",
+                "Chưa có mô hình nhận dạng trong thư mục gguf\\chandra,\nnên chưa quét được văn bản"),
+        None: ("OCR", ""),
+    },
+    "chat": {
+        True: ("Trợ lý sẵn sàng", "Mô hình trả lời của trợ lý pháp luật đã có trên máy"),
+        False: ("Thiếu mô hình trợ lý",
+                "Chưa có mô hình trong thư mục gguf\\chat,\nnên trợ lý pháp luật chưa trả lời được"),
+        None: ("Trợ lý", ""),
+    },
+}
+_ACTION_ICONS = {
+    "open_file": "scan", "open_files": "files", "import_folder": "folder-open", "open_chat": "chat",
+}
+
+
+def _native_stylesheet(c, brand):
+    return """
+#nativeLanding {{ background: {bg}; }}
+#nativeLanding QLabel {{ color: {text}; background: transparent; }}
+#nativeLanding QLabel#appName {{ color: {brand}; font-size: 10.5pt; font-weight: 600; }}
+#nativeLanding QLabel#registerTitle {{ font-size: 11pt; font-weight: 600; }}
+#nativeLanding QLabel#registerEmpty {{ color: {text_secondary}; padding: 8px 16px 20px 16px; }}
+#nativeLanding #statusLine QLabel {{ color: {text_secondary}; font-size: 8.5pt; }}
+#nativeLanding #statusLine QLabel[state="missing"] {{ color: {danger}; }}
+#nativeLanding QPushButton {{
+    background: {surface}; color: {text}; border: 1px solid {border_strong};
+    border-radius: 4px; padding: 0 14px 0 10px; min-height: 32px; font-weight: 500;
+}}
+#nativeLanding QPushButton:hover {{ background: {surface_hover}; }}
+#nativeLanding QPushButton:pressed {{ background: {surface_pressed}; }}
+#nativeLanding QPushButton:focus {{ border-color: {border_focus}; }}
+#nativeLanding QPushButton[kind="primary"] {{
+    background: {primary}; border-color: {primary}; color: {text_on_primary};
+}}
+#nativeLanding QPushButton[kind="primary"]:hover {{ background: {primary_hover}; border-color: {primary_hover}; }}
+#nativeLanding QPushButton[kind="primary"]:focus {{ border-color: {border_focus}; }}
+#nativeLanding QPushButton[kind="ghost"] {{ background: transparent; border-color: transparent; color: {brand}; }}
+#nativeLanding QPushButton[kind="ghost"]:hover {{ background: {surface_hover}; }}
+#nativeLanding QPushButton[kind="ghost"]:focus {{ border-color: {border_focus}; }}
+#register {{ background: {surface}; border: 1px solid {border}; border-radius: 4px; }}
+#registerRows {{
+    background: {surface}; color: {text}; border: none; outline: 0;
+    selection-background-color: {primary_soft}; selection-color: {text};
+}}
+#registerRows::item {{ padding: 9px 8px 9px 16px; border-bottom: 1px solid {border}; }}
+#registerRows::item:hover {{ background: {surface_hover}; }}
+#registerRows::item:selected {{ background: {primary_soft}; }}
+#registerRows QHeaderView::section {{
+    background: {surface}; color: {text_muted}; border: none; border-bottom: 1px solid {border};
+    padding: 0 8px 6px 16px; font-size: 8.5pt; font-weight: 500;
+}}
+QToolTip {{
+    background: {surface}; color: {text}; border: 1px solid {border_strong};
+    border-radius: 4px; padding: 5px 8px; font-size: 9pt;
+}}
+""".format(brand=brand, **c)
+
+
 class _NativeLanding(QWidget):
+    """The home page in plain Qt, for a build whose WebEngine is missing or
+    whose render process died: the same order as the HTML (brand, one primary
+    action, the register of recent documents, the status line), the same
+    tokens, both themes. Explanations and shortcuts are tooltips here too."""
+
+    ACTIONS = ("open_file", "open_files", "import_folder", "open_chat")
+
     def __init__(self, bridge, message="", parent=None):
         super().__init__(parent)
         self._bridge = bridge
+        snapshot = bridge.snapshot()
+        theme = snapshot.get("theme")
+        self._colors = colors = colors_for(theme)
+        self._brand_color = colors["primary_muted"] if theme == "dark" else colors["primary"]
+        specs = {
+            spec.get("action"): spec
+            for spec in (snapshot.get("commands") or landing_commands())
+        }
         self.setObjectName("nativeLanding")
-        self.setStyleSheet(
-            "#nativeLanding{background:#F5F1E8;color:#17231B;}"
-            "QLabel{color:#17231B;}"
-            "QPushButton{background:#FFFEFA;color:#24432D;border:1px solid #C9C2B3;"
-            "border-radius:10px;padding:14px 18px;text-align:left;min-height:36px;}"
-            "QPushButton:hover{border-color:#846314;background:#F9F5E9;}"
-        )
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet(_native_stylesheet(colors, self._brand_color))
+
         root = QVBoxLayout(self)
-        root.setContentsMargins(72, 48, 72, 48)
-        root.setSpacing(18)
-        brand_row = QHBoxLayout()
-        brand_row.setSpacing(12)
-        logo = QLabel()
+        root.setContentsMargins(32, 0, 32, 8)
+        root.setSpacing(0)
+        root.addWidget(self._brand())
+        root.addStretch(4)
+        # Created first so the primary action leads the tab order.
+        buttons = [
+            self._button(specs.get(action) or {"action": action},
+                         "primary" if action == "open_file" else "secondary")
+            for action in self.ACTIONS
+        ]
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        for button in buttons[:3]:
+            actions.addWidget(button)
+        actions.addStretch(1)
+        actions.addWidget(buttons[3])
+        root.addLayout(actions)
+        root.addSpacing(16)
+        root.addWidget(self._register(snapshot, specs))
+        root.addStretch(5)
+        root.addWidget(self._status_line(snapshot, message))
+
+    # ── pieces ──
+    def _brand(self):
+        bar = QWidget(self)
+        bar.setFixedHeight(56)
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        logo = QLabel(bar)
         logo.setObjectName("brandLogo")
-        logo.setFixedSize(48, 48)
-        logo.setPixmap(QPixmap(str(ROOT / "assets" / "app_icon_256.png")).scaled(
-            48, 48, Qt.KeepAspectRatio, Qt.SmoothTransformation
-        ))
-        brand = QLabel("OCR VBHC\nHỆ THỐNG SỐ HÓA VĂN BẢN")
-        brand.setStyleSheet("font-size:12pt;font-weight:600;color:#24432D;")
-        brand_row.addWidget(logo)
-        brand_row.addWidget(brand)
-        brand_row.addStretch(1)
-        root.addLayout(brand_row)
-        root.addStretch(1)
-        title = QLabel("Bắt đầu với văn bản hành chính")
-        title.setStyleSheet("font-size:26pt;font-weight:700;")
-        root.addWidget(title)
-        root.addWidget(QLabel("Chọn một tác vụ để số hóa, tra cứu hoặc hỏi đáp văn bản."))
-        row = QHBoxLayout()
-        actions = (
-            ("Quét một văn bản", "open_file"),
-            ("Thêm nhiều tệp", "open_files"),
-            ("Nhập thư mục", "import_folder"),
-            ("Mở kho văn bản", "open_library"),
-            ("Hỏi trợ lý pháp luật", "open_chat"),
-        )
-        for label, action in actions:
-            button = QPushButton(label)
-            button.clicked.connect(
-                lambda _checked=False, current=action: bridge.requestAction(current, "{}")
-            )
-            row.addWidget(button)
-        root.addLayout(row)
-        self._status = QLabel(message or "Sẵn sàng")
-        self._status.setStyleSheet("color:#5C665F;padding-top:16px;")
-        root.addWidget(self._status)
-        root.addStretch(2)
+        logo.setFixedSize(24, 24)
+        pixmap = QPixmap(str(ROOT / "assets" / "app_icon_256.png"))
+        if not pixmap.isNull():
+            pixmap = pixmap.scaled(48, 48, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            pixmap.setDevicePixelRatio(2.0)
+        logo.setPixmap(pixmap)
+        name = QLabel("OCR VBHC", bar)
+        name.setObjectName("appName")
+        row.addWidget(logo)
+        row.addWidget(name)
+        row.addStretch(1)
+        return bar
+
+    def _button(self, spec, kind):
+        action = spec.get("action")
+        button = QPushButton(spec.get("label") or action, self)
+        button.setProperty("kind", kind)
+        button.setCursor(Qt.PointingHandCursor)
+        name = _ACTION_ICONS.get(action)
+        if name and _icon is not None:
+            colour = self._colors["text_on_primary"] if kind == "primary" else self._brand_color
+            button.setIcon(_icon(name, 20, colour))
+        shortcut = spec.get("shortcut") or ""
+        tip = spec.get("hint") or ""
+        button.setToolTip("\n".join(part for part in (tip, shortcut) if part))
+        if shortcut:
+            QShortcut(QKeySequence(shortcut), self, activated=lambda current=action: self._request(current))
+        button.clicked.connect(lambda _checked=False, current=action: self._request(current))
+        return button
+
+    def _register(self, snapshot, specs):
+        sheet = QFrame(self)
+        sheet.setObjectName("register")
+        layout = QVBoxLayout(sheet)
+        layout.setContentsMargins(1, 6, 1, 1)
+        layout.setSpacing(2)
+        head = QHBoxLayout()
+        head.setContentsMargins(15, 0, 7, 0)
+        title = QLabel("Văn bản gần đây", sheet)
+        title.setObjectName("registerTitle")
+        head.addWidget(title)
+        head.addStretch(1)
+        head.addWidget(self._button(specs.get("open_library") or {"action": "open_library"}, "ghost"))
+        layout.addLayout(head)
+        documents = snapshot.get("recentDocuments") or []
+        if not documents:
+            empty = QLabel("Kho chưa có văn bản. Văn bản bạn quét sẽ hiện ở đây.", sheet)
+            empty.setObjectName("registerEmpty")
+            layout.addWidget(empty)
+            return sheet
+        layout.addWidget(self._rows(sheet, documents))
+        return sheet
+
+    def _rows(self, parent, documents):
+        c = self._colors
+        tree = QTreeWidget(parent)
+        tree.setObjectName("registerRows")
+        tree.setColumnCount(4)
+        tree.setHeaderLabels(["Số, ký hiệu", "Trích yếu", "Cập nhật", "Trang"])
+        tree.headerItem().setTextAlignment(3, Qt.AlignRight | Qt.AlignVCenter)
+        tree.setRootIsDecorated(False)
+        tree.setIndentation(0)
+        tree.setUniformRowHeights(True)
+        tree.setAllColumnsShowFocus(True)
+        tree.setMouseTracking(True)
+        tree.setFrameShape(QFrame.NoFrame)
+        tree.setSelectionMode(QAbstractItemView.SingleSelection)
+        tree.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        tree.setTextElideMode(Qt.ElideRight)
+        tree.viewport().setCursor(Qt.PointingHandCursor)
+        header = tree.header()
+        header.setStretchLastSection(False)
+        header.setSectionsMovable(False)
+        header.setHighlightSections(False)
+        for column, width in ((0, 184), (2, 136), (3, 64)):
+            header.setSectionResizeMode(column, QHeaderView.Fixed)
+            tree.setColumnWidth(column, width)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+
+        serif = QFont("Times New Roman")
+        serif.setPointSizeF(11)
+        small = QFont(self.font())
+        small.setPointSizeF(9)
+        gold, quiet = QColor(c["accent_gold"]), QColor(c["text_secondary"])
+        for doc in documents:
+            summary = " ".join(str(doc.get("summary") or "").split())
+            title = doc.get("title") or "Văn bản không tên"
+            short, full = describe_stamp(doc.get("updatedAt"))
+            pages = int(doc.get("pageCount") or 0)
+            item = QTreeWidgetItem([
+                doc.get("symbol") or "", summary or title, short, str(pages) if pages else "",
+            ])
+            item.setData(0, Qt.UserRole, doc.get("id"))
+            item.setFont(0, serif)
+            item.setForeground(0, gold)
+            item.setFont(1, serif if summary else small)
+            if not summary:
+                item.setForeground(1, quiet)
+            for column in (2, 3):
+                item.setFont(column, small)
+                item.setForeground(column, quiet)
+            item.setTextAlignment(3, Qt.AlignRight | Qt.AlignVCenter)
+            tip = "\n".join(part for part in (
+                summary, title if summary else "", "Cập nhật " + full if full else "",
+            ) if part)
+            for column in range(4):
+                item.setToolTip(column, tip)
+            tree.addTopLevelItem(item)
+        tree.itemClicked.connect(lambda item, _column: self._open(item))
+        for key in (Qt.Key_Return, Qt.Key_Enter):
+            QShortcut(QKeySequence(key), tree, context=Qt.WidgetShortcut,
+                      activated=lambda: self._open(tree.currentItem()))
+        tree.ensurePolished()
+        rows = sum(tree.sizeHintForRow(index) for index in range(tree.topLevelItemCount()))
+        tree.setFixedHeight(header.sizeHint().height() + rows + 2)
+        return tree
+
+    def _status_line(self, snapshot, message):
+        line = QWidget(self)
+        line.setObjectName("statusLine")
+        row = QHBoxLayout(line)
+        row.setContentsMargins(0, 12, 0, 2)
+        row.setSpacing(16)
+        models = snapshot.get("models") or {}
+        for kind in ("ocr", "chat"):
+            state = models.get(kind)
+            ready = None if state is None else state == "available"
+            label, tip = _MODEL_TEXT[kind][ready]
+            dot = {True: "success", False: "danger", None: "text_muted"}[ready]
+            widget = QLabel(line)
+            widget.setTextFormat(Qt.RichText)
+            widget.setText('<span style="color:{}">●</span>&nbsp;{}'.format(self._colors[dot], label))
+            widget.setProperty("state", {True: "ok", False: "missing", None: "unknown"}[ready])
+            widget.setToolTip(tip)
+            row.addWidget(widget)
+        for text, tip in (
+            ("{} văn bản".format(_group_digits(snapshot.get("documentCount"))),
+             "Văn bản đã lưu trong kho trên máy này"),
+            ("Chỉ mục {} đoạn".format(_group_digits(snapshot.get("chunkCount"))),
+             "Đoạn văn bản đã lập chỉ mục cho tìm kiếm và trợ lý pháp luật"),
+            ("Ngoại tuyến",
+             "Không cần Internet. Tệp, chỉ mục và mô hình đều xử lý trên thiết bị này."),
+        ):
+            widget = QLabel(text, line)
+            widget.setToolTip(tip)
+            row.addWidget(widget)
+        row.addStretch(1)
+        self._status = QLabel(message or "", line)
+        self._status.setObjectName("nativeMessage")
+        row.addWidget(self._status)
+        return line
+
+    # ── behaviour ──
+    def _request(self, action):
+        self._bridge.requestAction(action, "{}")
+
+    def _open(self, item):
+        doc_id = item.data(0, Qt.UserRole) if item is not None else None
+        if isinstance(doc_id, int):
+            self._bridge.requestAction("open_recent", json.dumps({"docId": doc_id}))
+
+    def _set_message(self, text, state):
+        self._status.setProperty("state", state)
+        self._status.style().unpolish(self._status)
+        self._status.style().polish(self._status)
+        self._status.setText(text)
 
     def set_progress(self, percent, message):
-        self._status.setText("{}%  ·  {}".format(int(percent), message))
+        self._set_message("{} {}%".format(message, int(percent)), "")
 
     def set_error(self, message):
-        self._status.setStyleSheet("color:#B3263E;padding-top:16px;")
-        self._status.setText(str(message))
+        self._set_message(str(message), "missing")

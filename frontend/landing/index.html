@@ -10,99 +10,100 @@
 <body>
   <main class="shell" id="app" aria-busy="true">
     <header class="topbar">
-      <div class="brand" aria-label="OCR VBHC">
-        <img class="brand-mark bear-mark" src="../../assets/app_icon_256.png" alt="Biểu tượng gấu OCR VBHC">
-        <span class="brand-copy"><b>OCR VBHC</b><small>HỆ THỐNG SỐ HÓA VĂN BẢN</small></span>
-      </div>
-      <div class="offline-icon" title="Ứng dụng hoạt động không cần Internet" aria-label="Chế độ ngoại tuyến">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 8.6A11.3 11.3 0 0 1 18.8 8M8.4 12a6.4 6.4 0 0 1 7.3-.1M11.2 15.4a2.3 2.3 0 0 1 2.2 0M12 19h.01M3 3l18 18"/></svg>
+      <div class="brand">
+        <img class="emblem" src="../../assets/app_icon_256.png" alt="Biểu tượng OCR VBHC">
+        <span class="app-name">OCR VBHC</span>
       </div>
     </header>
 
-    <section class="welcome">
-      <div class="intro">
-        <h1>Bắt đầu với<br>văn bản hành chính</h1>
-        <p class="lead">Số hóa, tra cứu và khai thác kho tri thức ngay trên thiết bị này.</p>
+    <div class="main">
+      <nav class="actions" aria-label="Bắt đầu">
+        <button class="btn btn-primary" type="button" data-action="open_file">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4.5 3C3.67 3 3 3.67 3 4.5v2a.5.5 0 0 1-1 0v-2A2.5 2.5 0 0 1 4.5 2h2a.5.5 0 0 1 0 1zm0 14A1.5 1.5 0 0 1 3 15.5v-2a.5.5 0 0 0-1 0v2A2.5 2.5 0 0 0 4.5 18h2a.5.5 0 0 0 0-1zM17 4.5c0-.83-.67-1.5-1.5-1.5h-2a.5.5 0 0 1 0-1h2A2.5 2.5 0 0 1 18 4.5v2a.5.5 0 0 1-1 0zM15.5 17c.83 0 1.5-.67 1.5-1.5v-2a.5.5 0 0 1 1 0v2a2.5 2.5 0 0 1-2.5 2.5h-2a.5.5 0 0 1 0-1zm-9-11a.5.5 0 0 0 0 1h7a.5.5 0 0 0 0-1zm0 3a.5.5 0 0 0 0 1h7a.5.5 0 0 0 0-1zM6 12.5c0-.28.22-.5.5-.5h4a.5.5 0 0 1 0 1h-4a.5.5 0 0 1-.5-.5"/></svg>
+          <span class="label">Quét một văn bản</span>
+        </button>
+        <button class="btn" type="button" data-action="open_files">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 4c0-1.1.9-2 2-2h3.59c.4 0 .78.16 1.06.44l3.91 3.91c.28.28.44.67.44 1.06V14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2zm2-1a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1V8h-3.5A1.5 1.5 0 0 1 9 6.5V3zm4 .2v3.3c0 .28.22.5.5.5h3.3zM17 9a1 1 0 0 0-1-1v6a3 3 0 0 1-3 3H6a1 1 0 0 0 1 1h6.06A3.94 3.94 0 0 0 17 14.06z"/></svg>
+          <span class="label">Thêm nhiều tệp</span>
+        </button>
+        <button class="btn" type="button" data-action="import_folder">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5.5v6.6l1.5-2.6A3 3 0 0 1 7.1 8H15v-.5c0-.83-.67-1.5-1.5-1.5h-4a.5.5 0 0 1-.35-.15l-1.71-1.7A.5.5 0 0 0 7.09 4H4.5C3.67 4 3 4.67 3 5.5m1.28 10.48.22.02h9.4a2 2 0 0 0 1.73-1l2.17-3.75A1.5 1.5 0 0 0 16.5 9H7.1a2 2 0 0 0-1.73 1L3.2 13.75a1.5 1.5 0 0 0 1.08 2.23M2 14.46V5.5A2.5 2.5 0 0 1 4.5 3h2.59c.4 0 .78.16 1.06.44L9.7 5h3.79A2.5 2.5 0 0 1 16 7.5V8h.5a2.5 2.5 0 0 1 2.16 3.75L16.5 15.5a3 3 0 0 1-2.6 1.5H4.5a2.5 2.5 0 0 1-1.62-.6A2.5 2.5 0 0 1 2 14.46"/></svg>
+          <span class="label">Nhập thư mục văn bản</span>
+        </button>
+        <button class="btn btn-chat" type="button" data-action="open_chat">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2a8 8 0 1 1-3.61 15.14l-.12-.07-3.65.92a.5.5 0 0 1-.62-.45v-.08l.01-.08.92-3.64-.07-.12a8 8 0 0 1-.83-2.9l-.02-.37L2 10a8 8 0 0 1 8-8m0 1a7 7 0 0 0-6.1 10.42.5.5 0 0 1 .06.28l-.02.1-.75 3.01 3.02-.75.19-.01.09.02.09.04A7 7 0 1 0 10 3m.5 8a.5.5 0 0 1 .09 1H7.5a.5.5 0 0 1-.09-1h3.09m2-3a.5.5 0 0 1 .09 1H7.5a.5.5 0 0 1-.09-1h5.09"/></svg>
+          <span class="label">Hỏi trợ lý pháp luật</span>
+        </button>
+      </nav>
+
+      <section class="register" aria-labelledby="recent-title">
+        <header class="register-head">
+          <h1 id="recent-title">Văn bản gần đây</h1>
+          <button class="btn btn-ghost" type="button" data-action="open_library">
+            <span class="label">Mở kho văn bản</span>
+          </button>
+        </header>
+        <div class="register-cols" id="recent-cols" aria-hidden="true" hidden>
+          <span>Số, ký hiệu</span><span>Trích yếu</span><span>Cập nhật</span><span class="col-pages">Trang</span>
+        </div>
+        <ol class="register-rows" id="recent-list"></ol>
+        <p class="empty" id="recent-empty" hidden>Kho chưa có văn bản. Văn bản bạn quét sẽ hiện ở đây.</p>
+      </section>
+    </div>
+
+    <footer class="statusbar">
+      <div class="status">
+        <span class="status-item" id="ocr-status" data-state="unknown"><i class="dot" aria-hidden="true"></i><span class="status-text">OCR</span></span>
+        <span class="status-item" id="chat-status" data-state="unknown"><i class="dot" aria-hidden="true"></i><span class="status-text">Trợ lý</span></span>
+        <span class="status-item" id="document-count" data-tip="Văn bản đã lưu trong kho trên máy này">0 văn bản</span>
+        <span class="status-item" id="chunk-count" data-tip="Đoạn văn bản đã lập chỉ mục cho tìm kiếm và trợ lý pháp luật">Chỉ mục 0 đoạn</span>
+        <span class="status-item offline-icon" role="img" aria-label="Ngoại tuyến" data-tip="Ngoại tuyến: không cần Internet. Tệp, chỉ mục và mô hình đều xử lý trên thiết bị này.">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 3l14 14M5.6 6.3A11 11 0 0 0 2.5 8.4M8.6 5.2A11 11 0 0 1 17.5 8.4M7.4 10.6a5.6 5.6 0 0 1 2.2-1.1M12.2 9.7a5.6 5.6 0 0 1 2.1 1.1M8.5 13.6a2.4 2.4 0 0 1 3 0"/><circle cx="10" cy="16" r=".9"/></svg>
+        </span>
       </div>
-
-      <div class="actions" aria-label="Tác vụ nhanh">
-        <button class="action" data-action="open_file">
-          <span class="action-icon"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M12 18v-6M9 15h6"/></svg></span>
-          <span><b>Quét một văn bản</b><small>PDF hoặc ảnh · Ctrl+O</small></span>
-        </button>
-        <button class="action" data-action="open_files">
-          <span class="action-icon"><svg viewBox="0 0 24 24"><path d="M15 2H6a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h8"/><path d="M14 2v6h6v5M16 19h6M19 16v6"/></svg></span>
-          <span><b>Thêm nhiều tệp</b><small>Xử lý theo lô · Ctrl+Shift+O</small></span>
-        </button>
-        <button class="action" data-action="import_folder">
-          <span class="action-icon"><svg viewBox="0 0 24 24"><path d="M3 6h6l2 2h10v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M12 11v6M9 14h6"/></svg></span>
-          <span><b>Nhập thư mục</b><small>Lập chỉ mục cả kho · Ctrl+Alt+O</small></span>
-        </button>
-        <button class="action" data-action="open_library">
-          <span class="action-icon"><svg viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></span>
-          <span><b>Mở kho văn bản</b><small>Duyệt và chỉnh sửa kết quả</small></span>
-        </button>
-        <button class="action action-wide" data-action="open_chat">
-          <span class="action-icon"><svg viewBox="0 0 24 24"><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/><path d="M8 9h8M8 13h5"/></svg></span>
-          <span><b>Hỏi trợ lý pháp luật</b><small>Trả lời kèm nguồn trích dẫn</small></span>
-        </button>
-      </div>
-    </section>
-
-    <section class="lower-grid">
-      <article class="panel recent-panel">
-        <div class="panel-heading"><div><p class="eyebrow">TIẾP TỤC</p><h2>Văn bản gần đây</h2></div><span id="document-count">0 văn bản</span></div>
-        <div id="recent-list" class="recent-list"><p class="empty">Kho chưa có văn bản. Hãy quét một tệp hoặc nhập thư mục.</p></div>
-      </article>
-      <aside class="panel readiness">
-        <p class="eyebrow">TRẠNG THÁI CỤC BỘ</p>
-        <h2>Sẵn sàng làm việc</h2>
-        <dl>
-          <div><dt>OCR</dt><dd id="ocr-status">Đang kiểm tra</dd></div>
-          <div><dt>Trợ lý</dt><dd id="chat-status">Đang kiểm tra</dd></div>
-          <div><dt>Chỉ mục</dt><dd id="chunk-count">0 đoạn</dd></div>
-        </dl>
-        <p class="privacy">Dữ liệu và mô hình được xử lý trên thiết bị này.</p>
-      </aside>
-    </section>
-
-    <footer>
-      <span>OCR VBHC · Phiên bản 2.0.0</span>
-      <button id="info-button" type="button" aria-haspopup="dialog" aria-controls="about-dialog">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg>
-        Thông tin ứng dụng
+      <button id="info-button" class="btn btn-ghost btn-small" type="button" aria-haspopup="dialog" aria-controls="about-dialog" data-tip="Phiên bản 2.0.0">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10.5 8.91a.5.5 0 0 0-1 .09v4.6a.5.5 0 0 0 1-.1V8.91m.3-2.16a.75.75 0 1 0-1.5 0 .75.75 0 0 0 1.5 0M18 10a8 8 0 1 0-16 0 8 8 0 0 0 16 0M3 10a7 7 0 1 1 14 0 7 7 0 0 1-14 0"/></svg>
+        <span class="label">Thông tin ứng dụng</span>
       </button>
-      <span aria-hidden="true"></span>
     </footer>
   </main>
 
   <section class="startup" id="startup" aria-live="polite" hidden>
-    <div><p class="eyebrow">ĐANG CHUẨN BỊ WORKSPACE</p><h2 id="startup-message">Đang khởi động…</h2><div class="progress"><i id="progress-bar"></i></div><span id="progress-value">0%</span></div>
+    <div class="startup-box">
+      <p id="startup-message">Đang khởi động…</p>
+      <div class="progress"><i id="progress-bar"></i></div>
+      <span id="progress-value">0%</span>
+    </div>
   </section>
-  <div class="notice" id="notice" role="alert" hidden></div>
+
+  <div class="notice" id="notice" role="alert" hidden>
+    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2a8 8 0 1 1 0 16 8 8 0 0 1 0-16m0 1a7 7 0 1 0 0 14 7 7 0 0 0 0-14m0 9.5a.75.75 0 1 1 0 1.5.75.75 0 0 1 0-1.5M10 6a.5.5 0 0 1 .5.41V11a.5.5 0 0 1-1 .09V6.5c0-.28.22-.5.5-.5"/></svg>
+    <span id="notice-text"></span>
+  </div>
+
+  <div class="tip" id="tip" role="tooltip" hidden></div>
 
   <dialog class="about" id="about-dialog" aria-labelledby="about-title" aria-hidden="true">
     <article class="about-card">
-      <button class="about-close" id="about-close" type="button" aria-label="Đóng thông tin ứng dụng">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>
+      <button class="btn btn-ghost btn-icon about-close" id="about-close" type="button" aria-label="Đóng" data-tip="Đóng">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m4.09 4.22.06-.07a.5.5 0 0 1 .63-.06l.07.06L10 9.29l5.15-5.14a.5.5 0 0 1 .63-.06l.07.06c.18.17.2.44.06.63l-.06.07L10.71 10l5.14 5.15c.18.17.2.44.06.63l-.06.07a.5.5 0 0 1-.63.06l-.07-.06L10 10.71l-5.15 5.14a.5.5 0 0 1-.63.06l-.07-.06a.5.5 0 0 1-.06-.63l.06-.07L9.29 10 4.15 4.85a.5.5 0 0 1-.06-.63l.06-.07z"/></svg>
       </button>
-      <div class="about-heading">
+      <header class="about-heading">
         <img src="../../assets/app_icon_256.png" alt="">
-        <div><p class="eyebrow">THÔNG TIN ỨNG DỤNG</p><h2 id="about-title">OCR VBHC</h2><p>Phiên bản 2.0.0 · Xử lý hoàn toàn cục bộ</p></div>
-      </div>
-      <p class="about-summary">Công cụ số hóa văn bản hành chính: nhận dạng PDF/ảnh, quản lý trường thông tin, lập chỉ mục và hỏi đáp có trích dẫn ngay trên máy.</p>
-      <div class="about-grid">
-        <section><h3>Người phát triển</h3><p>Trần Hậu Mạnh</p></section>
-        <section><h3>Quyền riêng tư</h3><p>Tệp, chỉ mục và hội thoại không cần gửi lên dịch vụ đám mây.</p></section>
-        <section><h3>Trí tuệ nhân tạo</h3><p>Chandra cho OCR tài liệu; Qwen3 4B/8B cho trợ lý pháp luật và điều phối công cụ.</p></section>
-        <section><h3>Kho tri thức RAG</h3><p>FTS5 tiếng Việt, sqlite-vec, xếp hạng lại ngữ nghĩa và đồ thị quan hệ pháp lý.</p></section>
-      </div>
-      <p class="about-note"><b>Lưu ý:</b> Câu trả lời AI chỉ hỗ trợ tra cứu, không thay thế ý kiến chuyên môn hoặc tư vấn pháp lý.</p>
+        <div><h2 id="about-title">OCR VBHC</h2><p>Phiên bản 2.0.0</p></div>
+      </header>
+      <p class="about-summary">Số hóa văn bản hành chính trên máy: nhận dạng PDF và ảnh, trích các trường thông tin theo Nghị định 30, lập chỉ mục và hỏi đáp có trích dẫn.</p>
+      <dl class="about-facts">
+        <div><dt>Người phát triển</dt><dd>Trần Hậu Mạnh</dd></div>
+        <div><dt>Quyền riêng tư</dt><dd>Tệp, chỉ mục và hội thoại ở lại trên máy; không gửi lên dịch vụ đám mây.</dd></div>
+        <div><dt>Trí tuệ nhân tạo</dt><dd>Chandra nhận dạng văn bản; Qwen3 4B/8B trả lời và điều phối công cụ cho trợ lý pháp luật.</dd></div>
+        <div><dt>Kho tri thức</dt><dd>Tìm kiếm toàn văn FTS5 tiếng Việt, sqlite-vec, xếp hạng lại ngữ nghĩa và đồ thị quan hệ pháp lý.</dd></div>
+      </dl>
+      <p class="about-note">Câu trả lời của trợ lý chỉ hỗ trợ tra cứu, không thay thế ý kiến chuyên môn hoặc tư vấn pháp lý.</p>
     </article>
   </dialog>
 
   <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
-  <script src="vendor/gsap.min.js"></script>
   <script src="landing.js"></script>
 </body>
 </html>

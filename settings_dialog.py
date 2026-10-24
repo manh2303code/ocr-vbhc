@@ -26,7 +26,7 @@ from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QWidget, QLabel,
     QRadioButton, QButtonGroup, QSlider, QCheckBox, QPushButton,
     QTableWidget, QTableWidgetItem, QHeaderView, QFormLayout,
-    QDialogButtonBox, QGroupBox, QSpinBox,
+    QDialogButtonBox, QGroupBox, QSpinBox, QFrame,
 )
 
 
@@ -72,67 +72,118 @@ def apply_ui_settings(app, status_bar) -> None:
 
 
 class SettingsDialog(QDialog):
-    """3-tab settings dialog: Giao diện · OCR · Phím tắt."""
+    """3-tab settings dialog: Giao diện, OCR, Phím tắt.
+
+    2026-10 minimal redesign: one sheet with text tabs, sections as a short
+    title over a hairline, labels without colons, explanations in tooltips
+    (the GPU note was printed in italics under its box), Vietnamese button
+    labels with Lưu as the one filled button. Styled by the "analytics" area
+    of the theme stylesheet (objectNames settings*); no colour is written
+    here, so the dialog follows a live theme switch by itself.
+    """
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
+        self.setObjectName("settingsDialog")
         self.setWindowTitle("Cài đặt")
         self.setMinimumSize(520, 440)
         self.setModal(True)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(8)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
         self._tabs = QTabWidget()
+        self._tabs.setObjectName("settingsTabs")
         self._tabs.addTab(self._build_appearance_tab(), "Giao diện")
         self._tabs.addTab(self._build_ocr_tab(), "OCR")
         self._tabs.addTab(self._build_shortcuts_tab(), "Phím tắt")
         root.addWidget(self._tabs, 1)
 
-        # Buttons: OK / Cancel / Apply
+        # Buttons: Lưu (OK) / Hủy / Áp dụng
+        footer = QFrame()
+        footer.setObjectName("settingsFooter")
+        footer_layout = QHBoxLayout(footer)
+        footer_layout.setContentsMargins(16, 10, 16, 12)
         self._btns = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel | QDialogButtonBox.Apply
         )
+        ok = self._btns.button(QDialogButtonBox.Ok)
+        ok.setText("Lưu")
+        ok.setProperty("variant", "primary")
+        ok.setToolTip("Lưu và đóng")
+        self._btns.button(QDialogButtonBox.Cancel).setText("Hủy")
+        apply_button = self._btns.button(QDialogButtonBox.Apply)
+        apply_button.setText("Áp dụng")
+        apply_button.setToolTip("Lưu và xem ngay, không đóng")
         self._btns.accepted.connect(self._on_accept)
         self._btns.rejected.connect(self.reject)
-        self._btns.button(QDialogButtonBox.Apply).clicked.connect(self._on_apply)
-        root.addWidget(self._btns)
+        apply_button.clicked.connect(self._on_apply)
+        footer_layout.addWidget(self._btns)
+        root.addWidget(footer)
 
         self._load_settings()
 
+    @staticmethod
+    def _page() -> tuple:
+        tab = QWidget()
+        tab.setObjectName("settingsPage")
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(20, 12, 20, 16)
+        layout.setSpacing(10)
+        return tab, layout
+
+    @staticmethod
+    def _form(group: QGroupBox) -> QFormLayout:
+        form = QFormLayout(group)
+        form.setContentsMargins(0, 4, 0, 0)
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(8)
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        return form
+
+    @staticmethod
+    def _label(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setProperty("role", "settingsLabel")
+        label.setMinimumWidth(110)
+        return label
+
     # ── Tab 1: Appearance ─────────────────────────────────────
     def _build_appearance_tab(self) -> QWidget:
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
+        tab, layout = self._page()
 
         # Theme group
         theme_group = QGroupBox("Chủ đề")
-        tl = QVBoxLayout(theme_group)
+        theme_group.setProperty("first", True)
+        tl = QHBoxLayout(theme_group)
+        tl.setContentsMargins(0, 4, 0, 0)
+        tl.setSpacing(24)
         self._theme_buttons = QButtonGroup(self)
-        self._rb_light = QRadioButton("Sáng (kem + vàng)")
-        self._rb_dark = QRadioButton("Tối (navy + gold)")
+        self._rb_light = QRadioButton("Sáng")
+        self._rb_dark = QRadioButton("Tối")
         self._theme_buttons.addButton(self._rb_light, 0)
         self._theme_buttons.addButton(self._rb_dark, 1)
         tl.addWidget(self._rb_light)
         tl.addWidget(self._rb_dark)
+        tl.addStretch()
         layout.addWidget(theme_group)
 
         # Font size group
         font_group = QGroupBox("Cỡ chữ")
-        fg = QFormLayout(font_group)
+        fg = self._form(font_group)
         self._spin_font = QSpinBox()
         self._spin_font.setRange(8, 14)
         self._spin_font.setSuffix(" pt")
         self._spin_font.setMinimumWidth(80)
-        fg.addRow("Cỡ chữ mặc định:", self._spin_font)
+        self._spin_font.setMaximumWidth(96)
+        fg.addRow(self._label("Cỡ chữ mặc định"), self._spin_font)
         layout.addWidget(font_group)
 
         # Status bar visibility
-        misc_group = QGroupBox("Giao diện khác")
+        misc_group = QGroupBox("Thanh trạng thái")
         mg = QVBoxLayout(misc_group)
+        mg.setContentsMargins(0, 4, 0, 0)
         self._chk_status_bar = QCheckBox("Hiện thanh trạng thái dưới cùng")
         mg.addWidget(self._chk_status_bar)
         layout.addWidget(misc_group)
@@ -142,30 +193,33 @@ class SettingsDialog(QDialog):
 
     # ── Tab 2: OCR ────────────────────────────────────────────
     def _build_ocr_tab(self) -> QWidget:
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
+        tab, layout = self._page()
 
         # Model info
         info_group = QGroupBox("Mô hình OCR")
-        ig = QFormLayout(info_group)
-        ig.addRow("Mô hình:", QLabel("Chandra OCR 2 · Q4_K_M"))
-        ig.addRow("Kích thước:", QLabel("~3 GB · GGUF format"))
-        ig.addRow("Server:", QLabel("llama-server · cổng 9999"))
+        info_group.setProperty("first", True)
+        ig = self._form(info_group)
+        for label, value in (("Mô hình", "Chandra OCR 2"),
+                             ("Lượng tử hóa", "Q4_K_M"),
+                             ("Kích thước", "Khoảng 3 GB, định dạng GGUF"),
+                             ("Máy chủ", "llama-server, cổng 9999")):
+            shown = QLabel(value)
+            shown.setProperty("role", "settingsValue")
+            shown.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            ig.addRow(self._label(label), shown)
         layout.addWidget(info_group)
 
         # GPU keep-alive
         perf_group = QGroupBox("Hiệu suất")
         pg = QVBoxLayout(perf_group)
-        self._chk_gpu_ka = QCheckBox(
-            "Giữ GPU warm giữa các lần OCR (+20% tốc độ ngắt khoảng)"
+        pg.setContentsMargins(0, 4, 0, 0)
+        self._chk_gpu_ka = QCheckBox("Giữ GPU sẵn sàng giữa các lần OCR")
+        self._chk_gpu_ka.setToolTip(
+            "Gửi tín hiệu tới máy chủ OCR mỗi 6 giây để GPU không chuyển sang chế độ nghỉ;\n"
+            "lần OCR tiếp theo bắt đầu nhanh hơn khoảng 20%.\n"
+            "Tắt khi máy chạy pin hoặc chỉ dùng CPU. Có hiệu lực sau khi mở lại ứng dụng."
         )
         pg.addWidget(self._chk_gpu_ka)
-        pg.addWidget(QLabel(
-            "<i>Ping server mỗi 6 giây để tránh GPU chuyển sang idle.\n"
-            "Tắt nếu máy tính hết pin hoặc dùng CPU-only.</i>"
-        ))
         layout.addWidget(perf_group)
 
         layout.addStretch()
@@ -173,27 +227,28 @@ class SettingsDialog(QDialog):
 
     # ── Tab 3: Shortcuts (read-only) ──────────────────────────
     def _build_shortcuts_tab(self) -> QWidget:
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(8)
-
-        label = QLabel(
-            "<b>Danh sách phím tắt</b> — mở nhanh bảng này bằng <code>F1</code>"
-        )
-        layout.addWidget(label)
+        tab, layout = self._page()
+        layout.setContentsMargins(8, 0, 8, 0)
 
         table = QTableWidget(len(SHORTCUT_LIST), 3)
+        table.setObjectName("settingsShortcuts")
+        table.setToolTip("Danh sách này cũng mở được bằng F1 ở cửa sổ chính")
         table.setHorizontalHeaderLabels(["Phím", "Chức năng", "Nhóm"])
         table.verticalHeader().setVisible(False)
         table.setSelectionBehavior(QTableWidget.SelectRows)
         table.setEditTriggers(QTableWidget.NoEditTriggers)
         table.setAlternatingRowColors(True)
+        table.setShowGrid(False)
+        table.setFrameShape(QFrame.NoFrame)
+        table.setWordWrap(False)
+        table.verticalHeader().setDefaultSectionSize(26)
         for row, (key, desc, group) in enumerate(SHORTCUT_LIST):
             table.setItem(row, 0, QTableWidgetItem(key))
             table.setItem(row, 1, QTableWidgetItem(desc))
             table.setItem(row, 2, QTableWidgetItem(group))
         header = table.horizontalHeader()
+        header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        header.setHighlightSections(False)
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)

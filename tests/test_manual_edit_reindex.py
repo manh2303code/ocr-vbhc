@@ -26,6 +26,7 @@ class _Window:
 
     def __init__(self):
         self.reindexed = []
+        self.related = []
 
     def load_documents(self):
         pass
@@ -35,6 +36,9 @@ class _Window:
 
     def _dispatch_embedding(self, doc_id):
         self.reindexed.append(doc_id)
+
+    def _dispatch_relations(self, doc_id):
+        self.related.append(doc_id)
 
     def statusBar(self):
         return _StatusBar()
@@ -47,6 +51,15 @@ class ManualEditReindexTests(unittest.TestCase):
         MainWindow.update_document(window, 7, {"so_ki_hieu": "02/CV"})
 
         self.assertEqual([7], window.reindexed)
+
+    def test_manual_edit_refreshes_relations_and_entities(self):
+        # A manual edit can change the number, date, signer or the cited
+        # documents; the legal graph must follow, not only the chunks.
+        window = _Window()
+
+        MainWindow.update_document(window, 7, {"so_ki_hieu": "02/CV"})
+
+        self.assertEqual([7], window.related)
 
 
 if __name__ == "__main__":

@@ -24,6 +24,3 @@
 *.pdf  binary
 *.xlsx binary
 *.docx binary
-
-# Vendored, minified third-party bundle — keep out of diffs and language stats.
-frontend/landing/vendor/* linguist-vendored -diff

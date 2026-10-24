@@ -1,26 +1,32 @@
 """
-Non-blocking floating progress manager.
+Non-blocking floating progress for batch OCR.
+
+A small surface that floats over the workspace (top-right of its parent):
+the title, the percent and two icon buttons on one row, the thin progress
+line of the theme, and the current step underneath. Collapsed, only the
+first row stays. Like every floating part of the 2026-10 redesign it is the
+surface colour with a border_strong hairline and the 6px popover radius, no
+shadow; colours come from the stylesheet ("AREA: dialogs" in
+devtools/theme_template.qss) and the icons from theme_tokens, recoloured on
+ThemeManager.theme_changed.
 
 Performance-optimized:
-- 5 widgets total (QFrame + 2 QLabel + QProgressBar + 2 QPushButton)
-- No custom paint / no drop shadow effect (expensive on Windows)
-- Border via CSS border-radius (GPU composited)
-- No polling timer — updates driven by worker thread emit()
-- Minimize = hide widget (preserves state, 0 re-create cost)
-- Drag via 2 event handlers (mousePress, mouseMove) — no event filter
+- a handful of widgets, no custom paint, no drop shadow effect
+- no polling timer: updates are driven by the worker's signals
+- minimize = hide the second row (state kept, nothing re-created)
+- drag via mousePress/mouseMove on the top row, no event filter
 
 API (for callers):
-    fp = FloatingProgress(parent=mainwindow)
-    fp.set_progress(0.45, "Đang xử lý file 7/10: 01.01.pdf")
-    fp.completed.connect(on_done)     # emitted when user clicks close
-    fp.cancelled.connect(on_cancel)   # emitted when user clicks cancel
-    fp.show()
+    fp = FloatingProgress(parent=mainwindow, title="Đang xử lý 12 văn bản")
+    fp.set_progress(0.45, "Tệp 7/12: 01.01.pdf")
+    fp.cancelled.connect(on_cancel)   # emitted when the user clicks close
+    fp.show_above()
     # ... later:
-    fp.set_progress(1.0, "Hoàn tất")
-    fp.auto_close_after(2000)   # fade-out 2s after completion
+    fp.mark_completed("Hoàn tất 12/12 văn bản")
+    fp.auto_close_after(2000)   # fade out 2 s after completion
 
-Replaces modal QDialog for batch OCR. For single-doc OCR <30s the
-existing blocking dialog remains (simpler UX).
+Replaces a modal QDialog for batch OCR. A single document keeps the
+blocking ProgressDialog (simpler for one short job).
 """
 from __future__ import annotations
 
@@ -28,121 +34,116 @@ import logging
 from typing import Optional
 
 from PyQt5.QtCore import (
-    Qt, pyqtSignal, QPoint, QTimer, QPropertyAnimation, QEasingCurve,
+    Qt, pyqtSignal, QPoint, QSize, QTimer, QPropertyAnimation, QEasingCurve,
 )
-from PyQt5.QtGui import QMouseEvent, QPalette, QColor
+from PyQt5.QtGui import QCursor, QMouseEvent
 from PyQt5.QtWidgets import (
-    QWidget, QFrame, QLabel, QProgressBar, QPushButton,
-    QHBoxLayout, QVBoxLayout, QSizePolicy, QGraphicsOpacityEffect,
+    QWidget, QFrame, QLabel, QProgressBar, QToolButton,
+    QHBoxLayout, QVBoxLayout, QGraphicsOpacityEffect,
 )
 
+import theme_tokens
+from editor_widgets import ElidedLabel
+from ui_icons import icon
+
 logger = logging.getLogger("FloatingProgress")
+
+
+def _current_theme() -> str:
+    try:
+        from theme_manager_v2 import ThemeManager
+        return ThemeManager.instance().current
+    except Exception:
+        return "light"
 
 
 class FloatingProgress(QFrame):
     """Draggable floating progress widget (non-modal, top-right docked).
 
     Emits:
-        cancelled()  when user clicks cancel button
-        minimized(bool)  when user toggles minimize (True=collapsed)
-        closed()     when user clicks X (same as cancelled if still running)
+        cancelled()  when user clicks the close button
+        minimized(bool)  when user toggles collapse (True=collapsed)
+        closed()     when it has faded out and hidden
     """
 
     cancelled = pyqtSignal()
     minimized = pyqtSignal(bool)
     closed = pyqtSignal()
 
-    # Fixed size constants — computed once, no layout jitter.
+    # Fixed sizes: no layout jitter while the text changes. Once completed
+    # there is no step line, so the expanded surface is shorter.
     WIDTH_EXPANDED = 340
-    HEIGHT_EXPANDED = 130
-    WIDTH_COLLAPSED = 180
-    HEIGHT_COLLAPSED = 36
+    HEIGHT_EXPANDED = 84
+    HEIGHT_COMPLETED = 58
+    WIDTH_COLLAPSED = 280
+    HEIGHT_COLLAPSED = 40
+    MARGIN = 16
+    ICON_SIZE = 16
 
     def __init__(self, parent: Optional[QWidget] = None, title: str = "Đang xử lý"):
-        # Parent is the MainWindow — keeps widget stacked above MainWindow
-        # but NOT a top-level Qt.Tool window (avoids taskbar entry).
+        # Parent is the MainWindow: the widget floats inside it, above its
+        # content, and is not a separate OS window (no taskbar entry).
         super().__init__(parent)
+        self.setObjectName("floatingProgress")
         self._title_text = title
         self._is_collapsed = False
+        self._is_completed = False
         self._drag_offset = QPoint()
         self._is_cancelled = False
 
-        # Frameless floating behavior via parent-relative positioning.
-        # Simpler than Qt.Tool + setWindowFlags (which creates new OS window).
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setAutoFillBackground(True)
-        self._apply_theme()
         self.resize(self.WIDTH_EXPANDED, self.HEIGHT_EXPANDED)
 
-        # Root layout — vertical with tight margins.
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 8, 12, 8)
-        root.setSpacing(4)
+        root.setContentsMargins(12, 8, 8, 10)
+        root.setSpacing(0)
 
-        # ── Header row: title + min/close ─────────────────
+        # ── Top row: done mark, title, percent, collapse, close ──
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
-        header.setSpacing(4)
-
-        self._title = QLabel(title)
-        self._title.setStyleSheet(
-            "color: #0F2B5B; font-weight: 700; font-size: 10pt;"
-            " background: transparent;"
-        )
+        header.setSpacing(6)
+        self._done_mark = QLabel()
+        self._done_mark.setFixedSize(self.ICON_SIZE, self.ICON_SIZE)
+        self._done_mark.hide()
+        header.addWidget(self._done_mark)
+        self._title = ElidedLabel(title)
+        self._title.setObjectName("floatingProgressTitle")
+        self._title.setToolTip(title)
         header.addWidget(self._title, 1)
-
-        # Minimize button — small, unobtrusive
-        self._min_btn = QPushButton("–")
-        self._min_btn.setFixedSize(24, 24)
-        self._min_btn.setCursor(Qt.PointingHandCursor)
-        self._min_btn.setToolTip("Thu gọn")
-        self._min_btn.setStyleSheet(self._small_btn_css())
-        self._min_btn.clicked.connect(self._toggle_collapse)
+        self._pct_label = QLabel("0%")
+        self._pct_label.setObjectName("floatingProgressPercent")
+        header.addWidget(self._pct_label)
+        header.addSpacing(2)
+        self._min_btn = self._tool_button("Thu gọn", self._toggle_collapse)
         header.addWidget(self._min_btn)
-
-        # Close button — X
-        self._close_btn = QPushButton("×")
-        self._close_btn.setFixedSize(24, 24)
-        self._close_btn.setCursor(Qt.PointingHandCursor)
-        self._close_btn.setToolTip("Đóng / hủy")
-        self._close_btn.setStyleSheet(self._small_btn_css(danger=True))
-        self._close_btn.clicked.connect(self._on_close)
+        self._close_btn = self._tool_button("Dừng xử lý", self._on_close)
         header.addWidget(self._close_btn)
-
         root.addLayout(header)
 
-        # ── Progress bar ──────────────────────────────────
+        # ── The progress line and the current step ──
+        self._body = QWidget()
+        body = QVBoxLayout(self._body)
+        body.setContentsMargins(0, 8, 4, 0)
+        body.setSpacing(6)
         self._bar = QProgressBar()
-        self._bar.setRange(0, 1000)  # 0-1000 for 0.1% resolution
+        self._bar.setObjectName("floatingProgressBar")
+        self._bar.setRange(0, 1000)  # 0.1% resolution
         self._bar.setValue(0)
         self._bar.setTextVisible(False)
-        self._bar.setFixedHeight(6)
-        self._bar.setStyleSheet(
-            "QProgressBar {"
-            " background: #E5E4DE; border: none; border-radius: 3px; }"
-            "QProgressBar::chunk {"
-            " background: qlineargradient(x1:0,y1:0,x2:1,y2:0,"
-            " stop:0 #1E3924, stop:1 #D4AF37); border-radius: 3px; }"
-        )
-        root.addWidget(self._bar)
-
-        # ── Status row: percent + detail ──────────────────
-        status_row = QHBoxLayout()
-        status_row.setContentsMargins(0, 0, 0, 0)
-        status_row.setSpacing(8)
-        self._pct_label = QLabel("0%")
-        self._pct_label.setStyleSheet(
-            "color: #6B7280; font-size: 9pt; font-weight: 600; background: transparent;"
-        )
-        self._pct_label.setFixedWidth(40)
-        self._detail_label = QLabel("")
-        self._detail_label.setStyleSheet(
-            "color: #4B5563; font-size: 9pt; background: transparent;"
-        )
+        body.addWidget(self._bar)
+        self._detail_label = ElidedLabel("")
+        self._detail_label.setObjectName("floatingProgressDetail")
         self._detail_label.setTextFormat(Qt.PlainText)
-        status_row.addWidget(self._pct_label)
-        status_row.addWidget(self._detail_label, 1)
-        root.addLayout(status_row)
+        body.addWidget(self._detail_label)
+        root.addWidget(self._body)
+        root.addStretch(1)
+
+        self._apply_theme()
+        try:
+            from theme_manager_v2 import ThemeManager
+            ThemeManager.instance().theme_changed.connect(self.apply_theme)
+        except Exception as exc:
+            logger.debug(f"Theme signal unavailable: {exc}")
 
         # Opacity effect for fade-in/out. Reused, not re-created per show.
         self._opacity = QGraphicsOpacityEffect(self)
@@ -159,81 +160,41 @@ class FloatingProgress(QFrame):
 
         self.hide()  # hidden until show_above() called
 
-    # ── Theme / CSS helpers ─────────────────────────────────
+    def _tool_button(self, tip, slot) -> QToolButton:
+        button = QToolButton()
+        button.setAutoRaise(True)
+        button.setFocusPolicy(Qt.NoFocus)
+        button.setIconSize(QSize(self.ICON_SIZE, self.ICON_SIZE))
+        button.setCursor(QCursor(Qt.PointingHandCursor))
+        button.setToolTip(tip)
+        button.setAccessibleName(tip)
+        button.clicked.connect(slot)
+        return button
+
+    # ── Theme ───────────────────────────────────────────────
     def _apply_theme(self) -> None:
-        """Apply current theme colors. Re-callable on theme change."""
-        try:
-            from theme_manager_v2 import ThemeManager
-            is_dark = ThemeManager.instance().is_dark
-        except Exception:
-            is_dark = False
+        """Icons from the tokens of the current theme. The surface, the
+        hairline and the text colours are the stylesheet's."""
+        tokens = theme_tokens.colors_for(_current_theme())
+        tone = tokens["text_secondary"]
+        self._min_btn.setIcon(icon(
+            "chevron-down" if self._is_collapsed else "chevron-up", self.ICON_SIZE, tone))
+        self._close_btn.setIcon(icon("x", self.ICON_SIZE, tone))
+        self._done_mark.setPixmap(
+            icon("status-ok", self.ICON_SIZE, tokens["success"]).pixmap(self.ICON_SIZE, self.ICON_SIZE))
 
-        if is_dark:
-            self.setStyleSheet("""
-                FloatingProgress {
-                    background: #1A2332;
-                    border: 1px solid #E5C466;
-                    border-radius: 10px;
-                }
-            """)
-            if hasattr(self, '_title'):
-                self._title.setStyleSheet(
-                    "color: #E5C466; font-weight: 700; font-size: 10pt;"
-                    " background: transparent;"
-                )
-            if hasattr(self, '_pct_label'):
-                self._pct_label.setStyleSheet(
-                    "color: #A8B2D1; font-size: 9pt; font-weight: 600; background: transparent;"
-                )
-            if hasattr(self, '_detail_label'):
-                self._detail_label.setStyleSheet(
-                    "color: #E8EBF5; font-size: 9pt; background: transparent;"
-                )
-        else:
-            self.setStyleSheet("""
-                FloatingProgress {
-                    background: #FFFFFF;
-                    border: 1px solid #D4AF37;
-                    border-radius: 10px;
-                }
-            """)
-            if hasattr(self, '_title'):
-                self._title.setStyleSheet(
-                    "color: #0F2B5B; font-weight: 700; font-size: 10pt;"
-                    " background: transparent;"
-                )
-            if hasattr(self, '_pct_label'):
-                self._pct_label.setStyleSheet(
-                    "color: #6B7280; font-size: 9pt; font-weight: 600; background: transparent;"
-                )
-            if hasattr(self, '_detail_label'):
-                self._detail_label.setStyleSheet(
-                    "color: #4B5563; font-size: 9pt; background: transparent;"
-                )
-
-    def apply_theme(self, name: str) -> None:
-        """Public hook called by ThemeManager.theme_changed signal."""
+    def apply_theme(self, name: str = "") -> None:
+        """Public hook called on ThemeManager.theme_changed."""
         self._apply_theme()
-
-    @staticmethod
-    def _small_btn_css(danger: bool = False) -> str:
-        color = "#B91C1C" if danger else "#4B5563"
-        hover_bg = "#FEE2E2" if danger else "#F0EFE8"
-        return (
-            "QPushButton {"
-            f" background: transparent; color: {color};"
-            " border: none; border-radius: 4px; font-size: 14pt;"
-            " font-weight: 600; padding: 0; }"
-            f"QPushButton:hover {{ background: {hover_bg}; }}"
-        )
 
     # ── Public API ──────────────────────────────────────────
     def set_progress(self, fraction: float, detail: str = "") -> None:
-        """Update progress bar + status text.
+        """Update the progress line, the percent and the current step.
 
         Args:
             fraction: 0.0-1.0 progress ratio
-            detail: status string (single line, truncated at 60 chars)
+            detail: the current step; one line, ending in "…" when it does
+                not fit, the whole of it in the tooltip
         """
         if self._is_cancelled:
             return  # ignore late updates after cancel
@@ -241,25 +202,27 @@ class FloatingProgress(QFrame):
         self._bar.setValue(int(fraction * 1000))
         self._pct_label.setText(f"{int(fraction * 100)}%")
         if detail:
-            # Truncate long detail so it fits in one line.
-            if len(detail) > 60:
-                detail = detail[:57] + "..."
-            self._detail_label.setText(detail)
+            self._set_detail(detail)
 
     def set_title(self, title: str) -> None:
         self._title_text = title
-        self._title.setText(title)
+        self._title.set_full_text(title)
+        self._title.setToolTip(title)
 
     def mark_completed(self, message: str = "Hoàn tất") -> None:
-        """Mark as done — progress bar turns solid gold, message shown."""
+        """Done: the full line, the check before the title, the message as
+        the title; the close button now only closes."""
+        self._is_completed = True
         self._bar.setValue(1000)
         self._pct_label.setText("100%")
-        self._detail_label.setText(message)
-        # Update title color to green-ish for completion signal.
-        self._title.setStyleSheet(
-            "color: #16A34A; font-weight: 700; font-size: 10pt;"
-            " background: transparent;"
-        )
+        self.set_title(message)
+        self._set_detail("")
+        self._detail_label.hide()
+        self._done_mark.show()
+        self._close_btn.setToolTip("Đóng")
+        self._close_btn.setAccessibleName("Đóng")
+        if not self._is_collapsed:
+            self.resize(self.WIDTH_EXPANDED, self._expanded_height())
 
     def auto_close_after(self, ms: int = 2500) -> None:
         """Schedule fade-out + hide after N milliseconds."""
@@ -267,17 +230,24 @@ class FloatingProgress(QFrame):
 
     def show_above(self) -> None:
         """Position top-right of parent, fade in."""
-        parent = self.parentWidget()
-        if parent:
-            # 16px margin from right/top edges.
-            x = parent.width() - self.width() - 16
-            y = 16
-            self.move(x, y)
+        self._snap_to_corner()
         self.raise_()
         self.show()
         self._fade_in()
 
     # ── Internal ────────────────────────────────────────────
+    def _set_detail(self, text: str) -> None:
+        self._detail_label.set_full_text(text)
+        self._detail_label.setToolTip(text)
+
+    def _expanded_height(self) -> int:
+        return self.HEIGHT_COMPLETED if self._is_completed else self.HEIGHT_EXPANDED
+
+    def _snap_to_corner(self) -> None:
+        parent = self.parentWidget()
+        if parent:
+            self.move(parent.width() - self.width() - self.MARGIN, self.MARGIN)
+
     def _fade_in(self) -> None:
         self._fade_anim.stop()
         self._fade_anim.setStartValue(self._opacity.opacity())
@@ -297,47 +267,31 @@ class FloatingProgress(QFrame):
         self._fade_anim.start()
 
     def _toggle_collapse(self) -> None:
-        """Shrink to pill-badge shape or expand back."""
+        """Keep only the top row, or show the progress line again."""
         self._is_collapsed = not self._is_collapsed
+        self._body.setVisible(not self._is_collapsed)
+        tip = "Mở rộng" if self._is_collapsed else "Thu gọn"
+        self._min_btn.setToolTip(tip)
+        self._min_btn.setAccessibleName(tip)
         if self._is_collapsed:
-            self._bar.hide()
-            self._detail_label.hide()
-            self._pct_label.setFixedWidth(80)  # wider when alone
-            self._min_btn.setText("+")
-            self._min_btn.setToolTip("Mở rộng")
             self.resize(self.WIDTH_COLLAPSED, self.HEIGHT_COLLAPSED)
-            # Snap back to corner after resize.
-            parent = self.parentWidget()
-            if parent:
-                self.move(parent.width() - self.width() - 16, 16)
         else:
-            self._bar.show()
-            self._detail_label.show()
-            self._pct_label.setFixedWidth(40)
-            self._min_btn.setText("–")
-            self._min_btn.setToolTip("Thu gọn")
-            self.resize(self.WIDTH_EXPANDED, self.HEIGHT_EXPANDED)
-            parent = self.parentWidget()
-            if parent:
-                self.move(parent.width() - self.width() - 16, 16)
+            self.resize(self.WIDTH_EXPANDED, self._expanded_height())
+        self._apply_theme()
+        self._snap_to_corner()
         self.minimized.emit(self._is_collapsed)
 
     def _on_close(self) -> None:
-        """Close button clicked — emit cancelled if still running."""
+        """Close button clicked — emit cancelled (a no-op once finished)."""
         self._is_cancelled = True
         self.cancelled.emit()
         self._fade_out_and_hide()
 
-    # ── Drag (mouse press + move on header area) ────────────
+    # ── Drag (mouse press + move on the top row) ────────────
     def mousePressEvent(self, event: QMouseEvent) -> None:
-        # Only allow drag from the TOP portion of the widget (above progress bar).
+        # Only the top row drags (the progress line and step are below it).
         if event.button() == Qt.LeftButton and event.y() < 32:
-            self._drag_offset = event.globalPos() - self.pos()
-            # But note: self.pos() is parent-relative. Use widget's top-left
-            # in parent coords. Recalc:
-            if self.parentWidget():
-                parent_top_left = self.mapToParent(self.rect().topLeft())
-                self._drag_offset = event.pos()  # local offset within widget
+            self._drag_offset = event.pos()  # local offset within widget
             event.accept()
         else:
             super().mousePressEvent(event)

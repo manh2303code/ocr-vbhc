@@ -1,81 +1,152 @@
 """
-Analytics Dashboard Dialog
-Cung cấp giao diện phân tích, thống kê và tìm kiếm văn bản
+Analytics dialog: the store at a glance and a filterable table of documents.
+
+2026-10 minimal redesign (docs/design/minimal-ui-2026-10.md). One sheet like
+the workspace: a header row with the title and two icon actions, the filters
+on the left, the table and the charts in tabs on the right, a status line at
+the bottom, all separated by hairlines. The four counts are figures, not
+coloured cards; the charts are flat, olive on the surface, values in the
+text colours, exact numbers one hover away.
+
+Colours: the dialog itself names none. Its widgets are styled by the
+"analytics" area of devtools/theme_template.qss (objectNames analytics*);
+the charts take theme_manager_v2.matplotlib_rc(theme) and the theme tokens.
+The stylesheet is now generated from the tokens for both themes, so the old
+workarounds (a dialog stylesheet re-declaring every widget, explicit
+palettes on every child to beat the global QLabel colour) are gone; the
+dialog only redraws its charts and recolours its icons on a theme change.
 """
-import os
-import sys
+import html
+import textwrap
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
-from collections import Counter
-from analytics_queries import fetch_latest_documents
+
+from analytics_queries import URGENCY_ORDER, fetch_latest_documents, urgency_label
 
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QWidget,
     QLabel, QPushButton, QLineEdit, QDateEdit, QComboBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QGroupBox,
     QFormLayout, QScrollArea, QFrame, QSplitter, QMessageBox,
-    QSizePolicy, QGridLayout, QTextEdit, QProgressBar
+    QSizePolicy, QGridLayout, QToolButton, QToolTip,
 )
-from PyQt5.QtCore import Qt, QDate, pyqtSignal
-from PyQt5.QtGui import QFont, QColor, QPainter, QPen, QBrush, QPalette
+from PyQt5.QtCore import Qt, QDate, QSize
+from PyQt5.QtGui import QColor, QCursor, QFont, QPainter
 
-from theme_manager_v2 import ThemeManager
+from theme_manager_v2 import ThemeManager, matplotlib_rc
 from theme_tokens import colors_for
+from ui_icons import icon
 
-# Thử import matplotlib
+# The bundled UI typeface, so the charts read like the rest of the window.
+_FONT_DIR = Path(__file__).resolve().parent / "assets" / "fonts"
+_CHART_FONTS = ["Be Vietnam Pro", "Segoe UI", "DejaVu Sans"]
+
 try:
     import matplotlib
     matplotlib.use('Qt5Agg')
-    # Font config — Vietnamese diacritics need Unicode-capable font. DejaVu
-    # Sans ships with matplotlib; Segoe UI is Windows-default. Priority list
-    # preserves rendering on both Linux (DejaVu) and Windows (Segoe UI).
-    matplotlib.rcParams['font.family'] = ['DejaVu Sans', 'Segoe UI', 'Arial', 'sans-serif']
-    matplotlib.rcParams['axes.unicode_minus'] = False
+    from matplotlib import font_manager
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
     from matplotlib.figure import Figure
+    from matplotlib.ticker import MaxNLocator
     HAS_MATPLOTLIB = True
 
-    class MplCanvas(FigureCanvas):
-        """Canvas matplotlib cho PyQt5.
+    for _name in ("BeVietnamPro-Regular.ttf", "BeVietnamPro-Medium.ttf",
+                  "BeVietnamPro-SemiBold.ttf"):
+        try:
+            font_manager.fontManager.addfont(str(_FONT_DIR / _name))
+        except Exception:
+            _CHART_FONTS = [f for f in _CHART_FONTS if f != "Be Vietnam Pro"]
 
-        Phase A 2026-04-17 + responsive fix: Expanding size policy so
-        charts fill available width/height when window resizes. Minimum
-        height 280px prevents collapse when stacked in scroll area.
-        """
-        def __init__(self, parent=None, width=8, height=4.5, dpi=100):
-            from PyQt5.QtWidgets import QSizePolicy
-            self.fig = Figure(figsize=(width, height), dpi=dpi,
-                              facecolor='#FFFFFF', edgecolor='none')
+    class MplCanvas(FigureCanvas):
+        """A matplotlib figure in the dialog: fills its cell, lays its labels
+        out by itself (constrained layout), and shows the exact value of the
+        slot under the pointer as a tooltip. The hit area of a slot is its
+        whole band, not only the bar."""
+
+        def __init__(self, parent=None, width=8, height=3, dpi=100):
+            self.fig = Figure(figsize=(width, height), dpi=dpi, layout="constrained")
             self.axes = self.fig.add_subplot(111)
             super().__init__(self.fig)
             self.setParent(parent)
-            # Responsive: expand to fill parent layout cell, maintain min height.
             self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            self.setMinimumHeight(280)
-            # Theme axes — olive/cream palette
-            self.axes.set_facecolor('#FFFFFF')
-            for spine in self.axes.spines.values():
-                spine.set_color('#E5E4DE')
-            self.axes.tick_params(colors='#4B5563')
+            self.setMinimumHeight(200)
+            self._hover_axis = None
+            self._hover = {}
+            self.mpl_connect("motion_notify_event", self._on_motion)
+            self.mpl_connect("figure_leave_event", lambda _event: QToolTip.hideText())
+
+        def set_hover(self, axis, texts):
+            """texts: slot index -> tooltip, along the x or y axis."""
+            self._hover_axis, self._hover = axis, dict(texts)
+
+        def hover_text(self, slot):
+            return self._hover.get(slot, "")
+
+        def _on_motion(self, event):
+            if event.inaxes is not self.axes or self._hover_axis is None:
+                QToolTip.hideText()
+                return
+            value = event.xdata if self._hover_axis == "x" else event.ydata
+            text = self._hover.get(int(round(value))) if value is not None else None
+            if text:
+                QToolTip.showText(QCursor.pos(), text, self)
+            else:
+                QToolTip.hideText()
 except ImportError:
     HAS_MATPLOTLIB = False
     MplCanvas = None  # guard for `if HAS_MATPLOTLIB:` callers
 
 
-class SimpleBarWidget(QWidget):
-    """Fallback bar chart when matplotlib not available.
+def chart_rc(theme):
+    """matplotlib_rc for the theme, set in the UI typeface."""
+    rc = matplotlib_rc(theme)
+    rc["font.family"] = list(_CHART_FONTS)
+    return rc
 
-    Phase A 2026-04-17: reserved label area expanded 30→80px for rotated labels
-    to render fully; colors aligned to theme olive/gold/red palette.
-    """
-    LABEL_AREA = 60   # vertical space reserved below bars for x-labels
-    TOP_PADDING = 16  # space above tallest bar for value text
+
+def _tip(text):
+    """A tooltip that wraps: Qt wraps rich text, never a plain long line."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    return "<p>{}</p>".format(html.escape(text, quote=False).replace("\n", "<br>"))
+
+
+def _month_slots(monthly, today):
+    """The twelve months up to this month as (year, month), oldest first, or
+    the twelve up to the newest month with documents when all are older.
+    Months without documents stay in the row, as zero."""
+    keys = []
+    for key in monthly:
+        try:
+            keys.append((int(key[:4]), int(key[5:7])))
+        except (TypeError, ValueError):
+            continue
+    end = (today.year, today.month)
+    if keys:
+        newest = max(keys)
+        if newest > end or (end[0] * 12 + end[1]) - (newest[0] * 12 + newest[1]) >= 12:
+            end = newest
+    slots = []
+    year, month = end
+    for _ in range(12):
+        slots.append((year, month))
+        year, month = (year, month - 1) if month > 1 else (year - 1, 12)
+    return list(reversed(slots))
+
+
+class SimpleBarWidget(QWidget):
+    """Fallback bar chart when matplotlib is not available: one olive series
+    on the surface, values and labels in the text colours."""
+    LABEL_AREA = 40   # vertical space reserved below bars for x-labels
+    TOP_PADDING = 18  # space above tallest bar for value text
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.data = []
         self.dark = False
-        self.setMinimumHeight(240)
+        self.setMinimumHeight(200)
 
     def set_data(self, data):
         self.data = data
@@ -88,372 +159,210 @@ class SimpleBarWidget(QWidget):
     def paintEvent(self, event):
         if not self.data:
             return
-
+        tokens = colors_for("dark" if self.dark else "light")
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-
         width = self.width()
         plot_height = self.height() - self.LABEL_AREA - self.TOP_PADDING
-        max_val = max([v for _, v in self.data]) if self.data else 1
-        n = len(self.data)
-        if n == 0:
-            return
-        bar_width = max(20, (width - 40) / n - 6)
-
-        # Bars cycle the identity colours. These were still the pre-rebalance
-        # values — #1E3924 olive and #D4AF37 gold — so the charts kept the old
-        # brand while the rest of the application had moved on.
-        tokens = colors_for("dark" if self.dark else "light")
-        palette = [
-            QColor(tokens[name]) for name in (
-                "primary", "accent_gold", "cta",
-                "primary_hover", "accent_gold_hover", "primary_muted",
-            )
-        ]
-        text_color = QColor(tokens["text"])
-        painter.setPen(text_color)
-
+        max_val = max(v for _, v in self.data) or 1
+        slot = (width - 40) / len(self.data)
+        bar_width = min(24, max(6, slot * 0.4))
+        baseline = self.TOP_PADDING + plot_height
+        painter.setPen(QColor(tokens["border"]))
+        painter.drawLine(20, int(baseline), int(width - 20), int(baseline))
         for i, (label, value) in enumerate(self.data):
-            x = 20 + i * (bar_width + 6)
-            bar_height = (value / max_val) * plot_height if max_val > 0 else 0
-            y = self.TOP_PADDING + (plot_height - bar_height)
-
-            painter.setBrush(palette[i % len(palette)])
+            x = 20 + i * slot + (slot - bar_width) / 2
+            bar_height = (value / max_val) * plot_height
             painter.setPen(Qt.NoPen)
-            painter.drawRect(int(x), int(y), int(bar_width), int(bar_height))
-
-            # Value label above bar
-            painter.setPen(text_color)
-            painter.drawText(int(x + bar_width / 4), int(y - 4), str(value))
-
-            # X-axis label — truncated with ellipsis if too long
+            painter.setBrush(QColor(tokens["primary_muted"]))
+            painter.drawRect(int(x), int(baseline - bar_height), int(bar_width), int(bar_height))
             painter.setPen(QColor(tokens["text_secondary"]))
-            label_text = label[:10] + "…" if len(label) > 12 else label
-            painter.drawText(int(x), int(self.height() - self.LABEL_AREA + 16),
-                             int(bar_width + 6), 20,
-                             Qt.AlignLeft | Qt.AlignTop, label_text)
+            painter.drawText(int(x - slot / 2), int(baseline - bar_height - 16),
+                             int(slot + bar_width), 14, Qt.AlignHCenter, str(value))
+            painter.setPen(QColor(tokens["text_muted"]))
+            text = painter.fontMetrics().elidedText(str(label), Qt.ElideRight, int(slot - 4))
+            painter.drawText(int(20 + i * slot), int(baseline + 6), int(slot), 16,
+                             Qt.AlignHCenter | Qt.AlignTop, text)
+        painter.end()
 
 
 class AnalyticsDialog(QDialog):
-    """Dialog phân tích và thống kê văn bản - Tất cả trong một giao diện"""
-    
+    """Phân tích kho văn bản: counts, charts and a filterable table."""
+
     def __init__(self, db, parent=None, initial_tab=None):
         super().__init__(parent)
         self.db = db
         self.initial_tab = initial_tab
         self.search_results = []
         self.all_documents = []
-        self.setup_ui()
+        self._charts_drawn = False
         self._theme_manager = ThemeManager.instance()
+        self._theme_name = self._theme_manager.current
+        self.setup_ui()
         self._theme_manager.register_widget(self)
         self.apply_theme(self._theme_manager.current)
         self.load_data()
-    
+
     def setup_ui(self):
-        self.setWindowTitle("Phân tích & Tìm kiếm văn bản — Analytics")
+        self.setWindowTitle("Phân tích kho văn bản")
         self.setObjectName("analyticsDialog")
         self.setFont(QFont("Be Vietnam Pro", 9))
         self.setMinimumSize(1100, 700)
         self.resize(1360, 820)
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(12, 10, 12, 10)
-        main_layout.setSpacing(8)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
-        # Compact header strip — slim 36px bar with title left + actions right.
-        # User feedback 2026-04-18: previous big banner wasted ~80px vertical,
-        # pushed charts down. Window title already shows app name — just use
-        # a minimal "section title" inline with refresh/export icons.
-        header_bar = QHBoxLayout()
-        header_bar.setSpacing(8)
-
-        section_title = QLabel("Bảng phân tích")
+        # Header: the title, then refresh and export as icon buttons.
+        header = QFrame()
+        header.setObjectName("analyticsHeader")
+        header_bar = QHBoxLayout(header)
+        header_bar.setContentsMargins(16, 6, 10, 6)
+        header_bar.setSpacing(2)
+        section_title = QLabel("Phân tích kho văn bản")
         section_title.setObjectName("analyticsSectionTitle")
-        section_title.setFont(QFont("Be Vietnam Pro", 12, QFont.Bold))
         self._section_title = section_title
         header_bar.addWidget(section_title)
-
         header_bar.addStretch()
-
-        # Inline action buttons (moved here from footer; saves ~60px).
-        self._header_refresh = QPushButton("Làm mới")
-        self._header_refresh.setFixedHeight(28)
+        self._header_refresh = self._tool_button(
+            "analyticsRefreshButton", "Làm mới\nĐọc lại số liệu từ kho văn bản")
         self._header_refresh.clicked.connect(self.load_data)
         header_bar.addWidget(self._header_refresh)
-
-        self._header_export = QPushButton("Xuất Excel")
-        self._header_export.setObjectName("analyticsExportButton")
-        self._header_export.setFixedHeight(28)
+        self._header_export = self._tool_button(
+            "analyticsExportButton", "Xuất bảng kết quả\nLưu các văn bản đang hiện ra tệp CSV, mở được bằng Excel")
         self._header_export.clicked.connect(self.export_report)
         header_bar.addWidget(self._header_export)
+        main_layout.addWidget(header)
 
-        main_layout.addLayout(header_bar)
-        
-        # Main content - Splitter
         splitter = QSplitter(Qt.Horizontal)
         splitter.setObjectName("analyticsSplitter")
+        splitter.setHandleWidth(1)
         self._splitter = splitter
         splitter.setChildrenCollapsible(False)
-        
-        # Left panel - Tìm kiếm & Lọc
-        left_panel = self.create_search_panel()
-        splitter.addWidget(left_panel)
-        
-        # Right panel - Kết quả & Biểu đồ
-        right_panel = self.create_results_panel()
-        splitter.addWidget(right_panel)
-        
+        splitter.addWidget(self.create_search_panel())
+        splitter.addWidget(self.create_results_panel())
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([310, 1050])
-        main_layout.addWidget(splitter)
-        
-        # Compact footer — only status + close (refresh/export moved to header).
-        footer = QHBoxLayout()
-        footer.setSpacing(8)
+        splitter.setSizes([300, 1060])
+        main_layout.addWidget(splitter, 1)
 
+        # Footer: what the table shows, and the way out.
+        footer = QFrame()
+        footer.setObjectName("analyticsFooter")
+        footer_bar = QHBoxLayout(footer)
+        footer_bar.setContentsMargins(16, 8, 12, 8)
+        footer_bar.setSpacing(8)
         self.status_label = QLabel("Sẵn sàng")
         self.status_label.setObjectName("analyticsStatus")
-        footer.addWidget(self.status_label)
-
-        footer.addStretch()
-
+        footer_bar.addWidget(self.status_label)
+        footer_bar.addStretch()
         close_btn = QPushButton("Đóng")
         close_btn.setObjectName("analyticsCloseButton")
         close_btn.clicked.connect(self.close)
-        footer.addWidget(close_btn)
+        footer_bar.addWidget(close_btn)
+        main_layout.addWidget(footer)
 
-        main_layout.addLayout(footer)
+    def _tool_button(self, name, tooltip):
+        button = QToolButton()
+        button.setObjectName(name)
+        button.setAutoRaise(True)
+        button.setIconSize(QSize(18, 18))
+        button.setToolTip(tooltip)
+        button.setAccessibleName(tooltip.split("\n", 1)[0])
+        button.setCursor(Qt.PointingHandCursor)
+        return button
 
     def apply_theme(self, name):
-        """Apply one coherent palette to every Analytics surface.
-
-        Analytics used to pin light backgrounds in a dialog stylesheet while
-        inheriting dark text roles from the application palette.  Keeping the
-        colors in one local token map prevents that mixed-theme state and also
-        lets an already-open dialog react to ThemeManager toggles.
-        """
-        dark = name == "dark"
-        # Names local to this dialog, values from the shared tokens. The map
-        # used to hold its own literals and had drifted: the light gold here was
-        # still #D4AF37 from before the palette was rebalanced for contrast.
-        tokens = colors_for("dark" if dark else "light")
-        colors = {
-            "bg": tokens["bg"],
-            "surface": tokens["surface"],
-            "soft": tokens["surface_alt"],
-            "header": tokens["surface_hover"],
-            "ink": tokens["text"],
-            "muted": tokens["text_secondary"],
-            "line": tokens["border"],
-            "primary": tokens["primary"],
-            "primary_hover": tokens["primary_hover"],
-            "accent": tokens["accent_gold"],
-            "gold": tokens["accent_gold_hover"],
-            "hover": tokens["surface_hover"],
-        }
-        self._theme_name = "dark" if dark else "light"
-        self._chart_colors = colors
-        c = colors
-        self.setStyleSheet(f"""
-            QDialog#analyticsDialog {{ background: {c['bg']}; color: {c['ink']}; }}
-            QDialog#analyticsDialog QWidget {{
-                color: {c['ink']}; font-family: 'Be Vietnam Pro'; font-size: 9pt;
-            }}
-            QDialog#analyticsDialog QWidget#analyticsSearchPanel,
-            QDialog#analyticsDialog QScrollArea,
-            QDialog#analyticsDialog QScrollArea > QWidget > QWidget {{
-                background: transparent;
-            }}
-            QDialog#analyticsDialog QGroupBox {{
-                background: {c['surface']}; border: 1px solid {c['line']};
-                border-radius: 8px; margin-top: 10px; padding: 8px 7px 7px;
-                font-weight: 600;
-            }}
-            QDialog#analyticsDialog QGroupBox::title {{
-                subcontrol-origin: margin; left: 9px; padding: 0 4px;
-                color: {c['accent']}; background: {c['bg']}; font-size: 8.5pt;
-            }}
-            QDialog#analyticsDialog QLineEdit,
-            QDialog#analyticsDialog QComboBox,
-            QDialog#analyticsDialog QDateEdit {{
-                color: {c['ink']}; background: {c['surface']};
-                border: 1px solid {c['line']}; border-radius: 6px;
-                padding: 3px 7px; min-height: 22px;
-                selection-background-color: {c['primary']};
-            }}
-            QDialog#analyticsDialog QLineEdit:focus,
-            QDialog#analyticsDialog QComboBox:focus,
-            QDialog#analyticsDialog QDateEdit:focus {{ border-color: {c['accent']}; }}
-            QDialog#analyticsDialog QComboBox QAbstractItemView {{
-                color: {c['ink']}; background: {c['surface']};
-                selection-background-color: {c['primary']};
-            }}
-            QDialog#analyticsDialog QPushButton {{
-                color: {c['ink']}; background: {c['surface']};
-                border: 1px solid {c['line']}; border-radius: 6px;
-                padding: 3px 10px; min-height: 24px;
-                font-size: 8.5pt; font-weight: 600;
-            }}
-            QDialog#analyticsDialog QPushButton:hover {{ background: {c['hover']}; }}
-            QDialog#analyticsDialog QPushButton:disabled {{ color: {c['muted']}; }}
-            QDialog#analyticsDialog QPushButton#analyticsExportButton,
-            QDialog#analyticsDialog QPushButton#content_search_btn {{
-                color: #FFFEFA; background: {c['primary']}; border: none;
-            }}
-            QDialog#analyticsDialog QPushButton#analyticsExportButton:hover,
-            QDialog#analyticsDialog QPushButton#content_search_btn:hover {{
-                background: {c['primary_hover']};
-            }}
-            QDialog#analyticsDialog QPushButton#show_all_btn {{
-                color: #17231B; background: {c['gold']}; border: none;
-            }}
-            QDialog#analyticsDialog QLabel#analyticsSectionTitle,
-            QDialog#analyticsDialog QLabel#analyticsResultsCount {{ color: {c['accent']}; }}
-            QDialog#analyticsDialog QLabel#analyticsStatus {{ color: {c['muted']}; font-size: 8.5pt; }}
-            QDialog#analyticsDialog QTabWidget::pane {{
-                background: {c['surface']}; border: 1px solid {c['line']};
-                border-radius: 7px;
-            }}
-            QDialog#analyticsDialog QTabBar::tab {{
-                color: {c['muted']}; background: transparent; padding: 6px 12px;
-                border-bottom: 2px solid transparent; font-size: 9pt; font-weight: 600;
-            }}
-            QDialog#analyticsDialog QTabBar::tab:selected {{
-                color: {c['accent']}; border-bottom-color: {c['accent']};
-            }}
-            QDialog#analyticsDialog QTableWidget {{
-                color: {c['ink']}; background: {c['surface']};
-                alternate-background-color: {c['soft']};
-                selection-background-color: {c['primary']};
-                selection-color: #FFFEFA; border: 1px solid {c['line']};
-                font-size: 8.5pt;
-            }}
-            QDialog#analyticsDialog QTableWidget::item {{ color: {c['ink']}; padding: 2px 5px; }}
-            QDialog#analyticsDialog QHeaderView::section {{
-                color: {c['ink']}; background: {c['header']}; border: none;
-                border-bottom: 1px solid {c['line']}; padding: 5px 6px;
-                font-size: 8.5pt; font-weight: 600;
-            }}
-            QDialog#analyticsDialog QScrollBar:vertical {{
-                width: 7px; background: transparent; margin: 2px;
-            }}
-            QDialog#analyticsDialog QScrollBar::handle:vertical {{
-                min-height: 28px; border-radius: 3px; background: {c['line']};
-            }}
-            QDialog#analyticsDialog QScrollBar::add-line:vertical,
-            QDialog#analyticsDialog QScrollBar::sub-line:vertical {{ height: 0; }}
-        """)
-
-        # Explicit palette roles keep item views and native date controls
-        # readable even when Windows/Qt style does not derive roles from QSS.
-        palette = self.palette()
-        role_colors = {
-            QPalette.Window: c["bg"], QPalette.WindowText: c["ink"],
-            QPalette.Base: c["surface"], QPalette.AlternateBase: c["soft"],
-            QPalette.Text: c["ink"], QPalette.Button: c["surface"],
-            QPalette.ButtonText: c["ink"], QPalette.Highlight: c["primary"],
-            QPalette.HighlightedText: colors_for(self._theme_name)["text_on_primary"],
-        }
-        for role, value in role_colors.items():
-            palette.setColor(role, QColor(value))
-        self.setPalette(palette)
-        for widget in self.findChildren(QWidget):
-            widget.setPalette(palette)
-
+        """Follow a theme switch: the stylesheet already changed with the
+        application; recolour the icons and redraw the charts."""
+        self._theme_name = "dark" if name == "dark" else "light"
+        tokens = colors_for(self._theme_name)
+        for button, glyph in ((self._header_refresh, "refresh-cw"),
+                              (self._header_export, "excel")):
+            button.setIcon(icon(glyph, size=18, color=tokens["text_secondary"]))
         for chart in self.findChildren(SimpleBarWidget):
             chart.set_theme(self._theme_name)
-
-        if self.all_documents:
+        if self._charts_drawn:
             self.update_charts()
-    
+
     def create_search_panel(self):
-        """Left search panel wrapped in QScrollArea.
+        """The left panel: four counts, then the three ways to filter.
 
-        Responsive fix 2026-04-17: at small window heights the content
-        panel (4 group boxes + 2 buttons) overflows the viewport and hides
-        the "Tìm kiếm nội dung" button. Wrapping in QScrollArea lets user
-        scroll through all filters regardless of window size.
+        Wrapped in a QScrollArea so every filter stays reachable in a short
+        window.
         """
-        # Inner content widget — original layout unchanged
         content = QWidget()
+        content.setObjectName("analyticsSearchContent")
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(7)
-        
-        # === THỐNG KÊ NHANH ===
-        # Brand palette: olive (primary), gold (accent), red (CTA), muted olive.
-        stats_group = QGroupBox("Thống kê nhanh")
-        stats_layout = QGridLayout(stats_group)
-        stats_layout.setContentsMargins(6, 9, 6, 6)
-        stats_layout.setSpacing(6)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(6)
 
-        # Stat cards also carried pre-rebalance literals; take the identity
-        # colours from the tokens so they follow the theme like everything else.
-        card_tokens = colors_for(getattr(self, "_theme_name", "light"))
-        self.total_docs_card = self.create_stat_card("Tổng VB",   "0", card_tokens["primary"])
-        self.today_docs_card = self.create_stat_card("Hôm nay",   "0", card_tokens["accent_gold"])
-        self.week_docs_card  = self.create_stat_card("Tuần này",  "0", card_tokens["cta"])
-        self.month_docs_card = self.create_stat_card("Tháng này", "0", card_tokens["primary_muted"])
-
+        # Counts by the day a document entered the store (documents.created_at).
+        stats = QWidget()
+        stats_layout = QGridLayout(stats)
+        stats_layout.setContentsMargins(0, 0, 0, 0)
+        stats_layout.setHorizontalSpacing(16)
+        stats_layout.setVerticalSpacing(10)
+        self.total_docs_card = self.create_stat_card(
+            "Tổng số", "0", "Mọi văn bản trong kho")
+        self.today_docs_card = self.create_stat_card(
+            "Hôm nay", "0", "Văn bản thêm vào kho hôm nay")
+        self.week_docs_card = self.create_stat_card(
+            "7 ngày qua", "0", "Văn bản thêm vào kho trong 7 ngày qua")
+        self.month_docs_card = self.create_stat_card(
+            "30 ngày qua", "0", "Văn bản thêm vào kho trong 30 ngày qua")
         stats_layout.addWidget(self.total_docs_card, 0, 0)
         stats_layout.addWidget(self.today_docs_card, 0, 1)
         stats_layout.addWidget(self.week_docs_card, 1, 0)
         stats_layout.addWidget(self.month_docs_card, 1, 1)
+        layout.addWidget(stats)
+        layout.addSpacing(6)
 
-        layout.addWidget(stats_group)
-
-        # === TÌM KIẾM THEO NGÀY ===
-        date_group = QGroupBox("Tìm theo ngày")
+        # By the day a document entered the store.
+        date_group = QGroupBox("Ngày thêm vào kho")
+        date_group.setToolTip("Lọc theo ngày văn bản được thêm vào kho, không phải ngày ban hành")
         date_layout = QFormLayout(date_group)
-
+        self._compact_form(date_layout)
         self.date_from = QDateEdit()
         self.date_from.setDate(QDate.currentDate().addMonths(-1))
         self.date_from.setCalendarPopup(True)
         self.date_from.setDisplayFormat("dd/MM/yyyy")
-        date_layout.addRow("Từ ngày:", self.date_from)
-
+        date_layout.addRow(self._field_label("Từ"), self.date_from)
         self.date_to = QDateEdit()
         self.date_to.setDate(QDate.currentDate())
         self.date_to.setCalendarPopup(True)
         self.date_to.setDisplayFormat("dd/MM/yyyy")
-        date_layout.addRow("Đến ngày:", self.date_to)
-
-        date_search_btn = QPushButton("Tìm theo ngày")
+        date_layout.addRow(self._field_label("Đến"), self.date_to)
+        date_search_btn = QPushButton("Lọc theo ngày")
         date_search_btn.clicked.connect(self.search_by_date)
-        date_layout.addRow(date_search_btn)
-
+        date_layout.addRow(self._right(date_search_btn))
         layout.addWidget(date_group)
 
-        # === TÌM KIẾM THEO SỐ KÝ HIỆU ===
-        number_group = QGroupBox("Tìm theo số ký hiệu")
-        number_layout = QVBoxLayout(number_group)
-
+        number_group = QGroupBox("Số hiệu")
+        number_layout = QHBoxLayout(number_group)
+        number_layout.setContentsMargins(0, 2, 0, 0)
+        number_layout.setSpacing(6)
         self.number_input = QLineEdit()
-        self.number_input.setPlaceholderText("Nhập số ký hiệu…")
+        self.number_input.setPlaceholderText("Ví dụ 336/KH")
+        self.number_input.setToolTip("Một phần số hiệu là đủ\nEnter để tìm")
+        self.number_input.setClearButtonEnabled(True)
         self.number_input.returnPressed.connect(self.search_by_number)
-        number_layout.addWidget(self.number_input)
-
-        number_search_btn = QPushButton("Tìm kiếm")
+        number_layout.addWidget(self.number_input, 1)
+        number_search_btn = QPushButton("Tìm")
         number_search_btn.clicked.connect(self.search_by_number)
         number_layout.addWidget(number_search_btn)
-
         layout.addWidget(number_group)
 
-        # === TÌM KIẾM THEO NỘI DUNG ===
-        content_group = QGroupBox("Tìm theo nội dung")
-        content_layout = QVBoxLayout(content_group)
-
-        # Single QLineEdit (agent QA fix 2026-04-17: earlier codepath had
-        # duplicate `self.content_input = QLineEdit()` assignment that leaked
-        # the first widget).
+        content_group = QGroupBox("Nội dung")
+        content_layout = QFormLayout(content_group)
+        self._compact_form(content_layout)
         self.content_input = QLineEdit()
-        self.content_input.setPlaceholderText("Nhập từ khóa tìm kiếm…")
+        self.content_input.setPlaceholderText("Từ khóa")
+        self.content_input.setToolTip(
+            "Tìm trong nội dung chính, số hiệu và cơ quan ban hành\nEnter để tìm")
+        self.content_input.setClearButtonEnabled(True)
         self.content_input.returnPressed.connect(self.search_by_content)
-        content_layout.addWidget(self.content_input)
-
-        # Bộ lọc loại văn bản
-        filter_row = QHBoxLayout()
-        filter_row.addWidget(QLabel("Loại VB:"))
+        content_layout.addRow(self.content_input)
         self.doc_type_filter = QComboBox()
         self.doc_type_filter.addItem("Tất cả", "")
         self.doc_type_filter.addItem("Báo cáo", "báo cáo")
@@ -461,31 +370,21 @@ class AnalyticsDialog(QDialog):
         self.doc_type_filter.addItem("Quyết định", "quyết định")
         self.doc_type_filter.addItem("Thông báo", "thông báo")
         self.doc_type_filter.addItem("Tờ trình", "tờ trình")
-        filter_row.addWidget(self.doc_type_filter)
-        content_layout.addLayout(filter_row)
-
-        # Bộ lọc cơ quan
+        content_layout.addRow(self._field_label("Loại"), self.doc_type_filter)
         self.org_filter = QLineEdit()
-        self.org_filter.setPlaceholderText("Lọc theo cơ quan ban hành…")
-        content_layout.addWidget(self.org_filter)
-
-        content_search_btn = QPushButton("Tìm kiếm nội dung")
+        self.org_filter.setPlaceholderText("Cơ quan ban hành")
+        self.org_filter.setClearButtonEnabled(True)
+        self.org_filter.returnPressed.connect(self.search_by_content)
+        content_layout.addRow(self._field_label("Cơ quan"), self.org_filter)
+        content_search_btn = QPushButton("Tìm")
         content_search_btn.setObjectName("content_search_btn")
         content_search_btn.clicked.connect(self.search_by_content)
-        content_layout.addWidget(content_search_btn)
-
+        content_layout.addRow(self._right(content_search_btn))
         layout.addWidget(content_group)
-
-        # === NÚT XEM TẤT CẢ ===
-        show_all_btn = QPushButton("Hiển thị tất cả văn bản")
-        show_all_btn.setObjectName("show_all_btn")
-        show_all_btn.clicked.connect(self.show_all_documents)
-        layout.addWidget(show_all_btn)
-
         layout.addStretch()
 
-        # Wrap in QScrollArea so all filters remain accessible on short windows.
         scroll = QScrollArea()
+        scroll.setObjectName("analyticsSearchScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -498,223 +397,191 @@ class AnalyticsDialog(QDialog):
         outer_layout = QVBoxLayout(outer)
         outer_layout.setContentsMargins(0, 0, 0, 0)
         outer_layout.addWidget(scroll)
-
         return outer
 
+    @staticmethod
+    def _compact_form(form):
+        form.setContentsMargins(0, 2, 0, 0)
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(6)
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
+    @staticmethod
+    def _field_label(text):
+        label = QLabel(text)
+        label.setProperty("role", "analyticsFieldLabel")
+        label.setMinimumWidth(44)
+        return label
+
+    @staticmethod
+    def _right(button):
+        row = QWidget()
+        box = QHBoxLayout(row)
+        box.setContentsMargins(0, 2, 0, 0)
+        box.addStretch()
+        box.addWidget(button)
+        return row
+
     def create_results_panel(self):
-        """Tạo panel kết quả bên phải"""
+        """The right panel: the table and the charts, as tabs."""
         panel = QWidget()
+        panel.setObjectName("analyticsResultsPanel")
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(5, 5, 5, 5)
-        
-        # Tabs cho kết quả và biểu đồ
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
         self.result_tabs = QTabWidget()
+        self.result_tabs.setObjectName("analyticsTabs")
 
-        # Tab 1: Kết quả tìm kiếm
-        results_tab = QWidget()
-        results_layout = QVBoxLayout(results_tab)
-
-        results_header = QHBoxLayout()
-        self.results_count_label = QLabel("Kết quả: 0 văn bản")
+        # How many documents the table shows, and the way back to all of them.
+        corner = QWidget()
+        corner.setObjectName("analyticsTabCorner")
+        corner_layout = QHBoxLayout(corner)
+        corner_layout.setContentsMargins(0, 0, 10, 0)
+        corner_layout.setSpacing(6)
+        self.results_count_label = QLabel("0 văn bản")
         self.results_count_label.setObjectName("analyticsResultsCount")
-        self.results_count_label.setFont(QFont("Be Vietnam Pro", 11, QFont.Bold))
-        results_header.addWidget(self.results_count_label)
-        results_header.addStretch()
-        results_layout.addLayout(results_header)
+        corner_layout.addWidget(self.results_count_label)
+        show_all_btn = QPushButton("Hiện tất cả")
+        show_all_btn.setObjectName("show_all_btn")
+        show_all_btn.setProperty("variant", "ghost")
+        show_all_btn.setToolTip("Bỏ bộ lọc, hiện mọi văn bản trong kho")
+        show_all_btn.setCursor(Qt.PointingHandCursor)
+        show_all_btn.clicked.connect(self.show_all_documents)
+        self._show_all_btn = show_all_btn
+        corner_layout.addWidget(show_all_btn)
+        self.result_tabs.setCornerWidget(corner, Qt.TopRightCorner)
 
         self.results_table = self.create_documents_table()
-        results_layout.addWidget(self.results_table)
-
-        self.result_tabs.addTab(results_tab, "Kết quả tìm kiếm")
-
-        # Tab 2: Biểu đồ thống kê
-        charts_tab = self.create_charts_tab()
-        self.result_tabs.addTab(charts_tab, "Biểu đồ thống kê")
-        
+        self.result_tabs.addTab(self.results_table, "Văn bản")
+        self.result_tabs.addTab(self.create_charts_tab(), "Biểu đồ")
+        self.result_tabs.currentChanged.connect(
+            lambda index: corner.setVisible(index == 0))
         layout.addWidget(self.result_tabs)
-        
         return panel
-    
-    def create_charts_tab(self):
-        """3 charts stacked in a scroll area with equal stretch factors.
 
-        Responsive fix 2026-04-17: each chart group gets stretch factor 1
-        so all three share available height equally. MplCanvas has
-        Expanding size policy so they fill width. Outer scroll kicks in
-        only when window is too short (<900px total for 3 × 280px minimum).
-        """
+    def create_charts_tab(self):
+        """By month across the top; urgency and issuing bodies below."""
         widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(0, 0, 0, 0)
+        widget.setObjectName("analyticsCharts")
+        grid = QGridLayout(widget)
+        grid.setContentsMargins(20, 14, 20, 14)
+        grid.setHorizontalSpacing(28)
+        grid.setVerticalSpacing(18)
+
+        def block(title, tooltip, attr_canvas, attr_simple):
+            box = QWidget()
+            box.setObjectName("analyticsChartBlock")
+            box_layout = QVBoxLayout(box)
+            box_layout.setContentsMargins(0, 0, 0, 0)
+            box_layout.setSpacing(4)
+            label = QLabel(title)
+            label.setProperty("role", "analyticsChartTitle")
+            label.setToolTip(tooltip)
+            box_layout.addWidget(label)
+            if HAS_MATPLOTLIB:
+                chart = MplCanvas(box, width=6, height=2.6)
+                setattr(self, attr_canvas, chart)
+            else:
+                chart = SimpleBarWidget()
+                setattr(self, attr_simple, chart)
+            box_layout.addWidget(chart, 1)
+            return box
+
+        grid.addWidget(block(
+            "Văn bản thêm vào kho theo tháng",
+            "Mười hai tháng gần nhất, theo ngày văn bản được thêm vào kho",
+            "monthly_canvas", "monthly_chart"), 0, 0, 1, 2)
+        grid.addWidget(block(
+            "Độ khẩn", "Độ khẩn theo Nghị định 30; văn bản không ghi độ khẩn là Thường",
+            "doc_type_canvas", "doc_type_chart"), 1, 0)
+        grid.addWidget(block(
+            "Cơ quan ban hành nhiều văn bản nhất", "Tám cơ quan có nhiều văn bản nhất trong kho",
+            "org_canvas", "org_chart"), 1, 1)
+        grid.setColumnStretch(0, 2)
+        grid.setColumnStretch(1, 3)
+        grid.setRowStretch(0, 1)
+        grid.setRowStretch(1, 1)
 
         scroll = QScrollArea()
+        scroll.setObjectName("analyticsChartsScroll")
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
-        scroll_widget = QWidget()
-        scroll_layout = QVBoxLayout(scroll_widget)
-        scroll_layout.setContentsMargins(6, 6, 6, 6)
-        scroll_layout.setSpacing(10)
+        widget.setMinimumHeight(480)
+        scroll.setWidget(widget)
+        return scroll
 
-        # Chart 1 — Pie (Phân loại văn bản)
-        chart1_group = QGroupBox("Phân loại văn bản")
-        chart1_layout = QVBoxLayout(chart1_group)
-        chart1_layout.setContentsMargins(8, 20, 8, 8)
-        if HAS_MATPLOTLIB:
-            self.doc_type_canvas = MplCanvas(self, width=8, height=4.5)
-            chart1_layout.addWidget(self.doc_type_canvas)
-        else:
-            self.doc_type_chart = SimpleBarWidget()
-            chart1_layout.addWidget(self.doc_type_chart)
-        scroll_layout.addWidget(chart1_group, 1)  # stretch = 1
-
-        # Chart 2 — Monthly bar
-        chart2_group = QGroupBox("Văn bản theo tháng")
-        chart2_layout = QVBoxLayout(chart2_group)
-        chart2_layout.setContentsMargins(8, 20, 8, 8)
-        if HAS_MATPLOTLIB:
-            self.monthly_canvas = MplCanvas(self, width=8, height=4.5)
-            chart2_layout.addWidget(self.monthly_canvas)
-        else:
-            self.monthly_chart = SimpleBarWidget()
-            chart2_layout.addWidget(self.monthly_chart)
-        scroll_layout.addWidget(chart2_group, 1)
-
-        # Chart 3 — Horizontal bar (Cơ quan ban hành)
-        chart3_group = QGroupBox("Cơ quan ban hành")
-        chart3_layout = QVBoxLayout(chart3_group)
-        chart3_layout.setContentsMargins(8, 20, 8, 8)
-        if HAS_MATPLOTLIB:
-            self.org_canvas = MplCanvas(self, width=8, height=4.5)
-            chart3_layout.addWidget(self.org_canvas)
-        else:
-            self.org_chart = SimpleBarWidget()
-            chart3_layout.addWidget(self.org_chart)
-        scroll_layout.addWidget(chart3_group, 1)
-
-        scroll.setWidget(scroll_widget)
-        layout.addWidget(scroll)
-
-        return widget
-    
-    def create_stat_card(self, title, value, color):
-        """Compact stat card — title above, value below.
-
-        Phase A 2026-04-17 + agent QA fix loop:
-        - Value font reduced 18pt → 14pt (fix "7X" truncation)
-        - Text color applied via objectName + QSS specific selectors so the
-          global `theme.qss` `QLabel { color: #1F2937 }` doesn't override.
-          Root cause: Qt app-level stylesheet takes precedence over widget
-          stylesheet's descendant QLabel rule. Targeted selectors via
-          `QFrame#stat_card QLabel#stat_title` break the tie.
-        - Gold card (#D4AF37) uses DARK text (WCAG AA fix: white on gold
-          was 1.9:1, needs 4.5:1). Other dark-bg cards keep light text.
-        """
-        # WCAG: white on gold #D4AF37 = 1.9:1 (FAIL). Switch to dark text.
-        is_light_bg = color.upper() == '#D4AF37'
-        fg = '#1F2937' if is_light_bg else '#FFFFFF'
-        fg_muted = 'rgba(31,41,55,0.75)' if is_light_bg else 'rgba(255,255,255,0.85)'
-
+    def create_stat_card(self, title, value, tooltip=""):
+        """A count: a small muted label over the figure. The figure label
+        keeps the objectName stat_value (update_statistics finds it)."""
         card = QFrame()
         card.setObjectName("stat_card")
-        card.setMinimumHeight(58)
-        card.setStyleSheet(f"""
-            QFrame#stat_card {{
-                background-color: {color};
-                border-radius: 10px;
-                padding: 6px 10px;
-            }}
-        """)
+        card.setToolTip(tooltip)
         layout = QVBoxLayout(card)
-        layout.setContentsMargins(6, 5, 6, 5)
-        layout.setSpacing(1)
-
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         title_label = QLabel(title)
         title_label.setObjectName("stat_title")
-        title_label.setFont(QFont("Be Vietnam Pro", 8))
-        title_label.setAlignment(Qt.AlignCenter)
-        # Direct label setStyleSheet wins over app-level theme.qss QLabel rule.
-        title_label.setStyleSheet(
-            f"QLabel#stat_title {{ color: {fg_muted}; background: transparent; }}"
-        )
         layout.addWidget(title_label)
-
         value_label = QLabel(value)
         value_label.setObjectName("stat_value")
-        value_label.setFont(QFont("Be Vietnam Pro", 12, QFont.Bold))
-        value_label.setAlignment(Qt.AlignCenter)
         value_label.setWordWrap(False)
-        value_label.setMaximumWidth(160)
-        value_label.setStyleSheet(
-            f"QLabel#stat_value {{ color: {fg}; background: transparent; }}"
-        )
         layout.addWidget(value_label)
-
         return card
-    
-    def create_documents_table(self):
-        """Tạo bảng văn bản — Interactive columns with sensible defaults.
 
-        Responsive fix 2026-04-17: switched from ResizeToContents (which
-        pinned Số KH / Ngày BH narrow and wasted space on ID) to Interactive
-        with explicit default widths + Stretch on Nội dung (the only column
-        that should absorb window-width changes). User can drag column
-        borders to customize; "Nội dung chính" auto-fills remaining space.
-        """
+    def create_documents_table(self):
+        """The documents, one row each. Columns can be dragged wider; the
+        main content absorbs the rest of the width. A cell too narrow for
+        its text ends in "…" and shows the whole text as its tooltip."""
         table = QTableWidget()
+        table.setObjectName("analyticsTable")
         table.setColumnCount(7)
         table.setHorizontalHeaderLabels([
-            "ID", "Số ký hiệu", "Ngày BH", "Loại VB",
-            "Cơ quan BH", "Nội dung chính", "File"
+            "ID", "Số hiệu", "Ngày ban hành", "Loại văn bản",
+            "Cơ quan ban hành", "Nội dung chính", "Tệp"
         ])
-
         header = table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.Interactive)
-        header.setSectionResizeMode(1, QHeaderView.Interactive)
-        header.setSectionResizeMode(2, QHeaderView.Interactive)
-        header.setSectionResizeMode(3, QHeaderView.Interactive)
-        header.setSectionResizeMode(4, QHeaderView.Interactive)
-        header.setSectionResizeMode(5, QHeaderView.Stretch)        # fills spare
-        header.setSectionResizeMode(6, QHeaderView.Interactive)
-        # Sensible default widths (user can drag to adjust).
-        table.setColumnWidth(0, 50)    # ID
-        table.setColumnWidth(1, 130)   # Số ký hiệu
-        table.setColumnWidth(2, 100)   # Ngày BH
-        table.setColumnWidth(3, 110)   # Loại VB
-        table.setColumnWidth(4, 180)   # Cơ quan
-        table.setColumnWidth(6, 160)   # File
-
+        for column in range(7):
+            header.setSectionResizeMode(column, QHeaderView.Interactive)
+        header.setSectionResizeMode(5, QHeaderView.Stretch)
+        header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        table.setColumnWidth(0, 48)
+        table.setColumnWidth(1, 140)
+        table.setColumnWidth(2, 112)
+        table.setColumnWidth(3, 104)
+        table.setColumnWidth(4, 180)
+        table.setColumnWidth(6, 150)
         header.setStretchLastSection(False)
         header.setMinimumSectionSize(40)
-        # Taller rows so Vietnamese diacritics don't clip + better readability.
+        header.setHighlightSections(False)
         table.verticalHeader().setDefaultSectionSize(25)
         table.verticalHeader().setVisible(False)
-
         table.setAlternatingRowColors(True)
         table.setSelectionBehavior(QTableWidget.SelectRows)
         table.setEditTriggers(QTableWidget.NoEditTriggers)
         table.setWordWrap(False)
         table.setTextElideMode(Qt.ElideRight)
         table.setShowGrid(False)
-
+        table.setFrameShape(QFrame.NoFrame)
         return table
-    
+
     def load_data(self):
         """Tải dữ liệu từ database"""
         try:
             if not self.db:
-                self.status_label.setText("Không có kết nối database")
+                self.status_label.setText("Không có kết nối cơ sở dữ liệu")
+                self.update_charts()  # empty, but in the theme
                 return
-
             self.all_documents = self.get_all_documents()
             self.update_statistics()
             self.update_charts()
             self.show_all_documents()
             self.status_label.setText(f"Đã tải {len(self.all_documents)} văn bản")
-            
         except Exception as e:
             self.status_label.setText(f"Lỗi: {str(e)}")
             print(f"Error loading data: {e}")
-    
+
     def get_all_documents(self):
         """Lấy tất cả văn bản"""
         try:
@@ -723,16 +590,14 @@ class AnalyticsDialog(QDialog):
         except Exception as e:
             print(f"Error: {e}")
             return []
-    
+
     def update_statistics(self):
         """Cập nhật thống kê"""
         total = len(self.all_documents)
         today = datetime.now().date()
         week_ago = today - timedelta(days=7)
         month_ago = today - timedelta(days=30)
-        
         today_count = week_count = month_count = 0
-        
         for doc in self.all_documents:
             try:
                 created = doc[3]
@@ -741,352 +606,269 @@ class AnalyticsDialog(QDialog):
                         doc_date = datetime.strptime(created[:10], "%Y-%m-%d").date()
                     else:
                         doc_date = created.date() if hasattr(created, 'date') else created
-                    
                     if doc_date == today:
                         today_count += 1
                     if doc_date >= week_ago:
                         week_count += 1
                     if doc_date >= month_ago:
                         month_count += 1
-            except:
+            except Exception:
                 pass
-        
-        # ObjectName changed in Phase A from "value" to "stat_value" (to
-        # disambiguate title vs value labels). Update findChild lookups.
         self.total_docs_card.findChild(QLabel, "stat_value").setText(str(total))
         self.today_docs_card.findChild(QLabel, "stat_value").setText(str(today_count))
         self.week_docs_card.findChild(QLabel, "stat_value").setText(str(week_count))
         self.month_docs_card.findChild(QLabel, "stat_value").setText(str(month_count))
-    
+
     def update_charts(self):
-        """Aggregate counters from loaded documents for 3 charts.
-
-        2026-04-18: pie chart switched from "Loại VB" → "Độ khẩn" per user
-        feedback — urgency distribution is more actionable for a document
-        management dashboard (hot/cold workload insight) than doc-type breakdown.
-        """
-        urgency = Counter()         # do_khan field
-        orgs = Counter()            # cqbh_tren
-        monthly = Counter()         # by YYYY-MM
-
+        """Count the loaded documents for the three charts: urgency (NĐ30
+        level, an empty mark is Thường), issuing body, month added."""
+        urgency = Counter()
+        orgs = Counter()
+        monthly = Counter()
         for doc in self.all_documents:
-            # Normalize urgency label — empty or None becomes "Thường"
-            urg_raw = (doc[9] or "").strip()
-            if not urg_raw:
-                urg = "Thường"
-            elif urg_raw.lower() in ("khẩn", "khan"):
-                urg = "Khẩn"
-            elif urg_raw.lower() in ("thượng khẩn", "thuong khan"):
-                urg = "Thượng Khẩn"
-            elif urg_raw.lower() in ("hỏa tốc", "hoa toc"):
-                urg = "Hỏa Tốc"
-            else:
-                urg = urg_raw
-            urgency[urg] += 1
-
-            org = doc[7] or "Không xác định"
-            orgs[org] += 1
-
+            urgency[urgency_label(doc[9])] += 1
+            orgs[(doc[7] or "").strip() or "Không xác định"] += 1
             try:
                 created = doc[3]
                 if created:
-                    if isinstance(created, str):
-                        month_key = created[:7]
-                    else:
-                        month_key = created.strftime("%Y-%m")
+                    month_key = created[:7] if isinstance(created, str) else created.strftime("%Y-%m")
                     monthly[month_key] += 1
             except Exception:
                 pass
-
         if HAS_MATPLOTLIB:
             self.update_matplotlib_charts(urgency, orgs, monthly)
         else:
             self.update_simple_charts(urgency, orgs, monthly)
+        self._charts_drawn = True
 
-    def _style_chart_axes(self, canvas):
-        """Synchronize an existing matplotlib canvas with the dialog theme."""
-        c = self._chart_colors
-        canvas.fig.set_facecolor(c["bg"])
-        canvas.axes.set_facecolor(c["surface"])
-        canvas.axes.tick_params(colors=c["muted"])
-        canvas.axes.xaxis.label.set_color(c["ink"])
-        canvas.axes.yaxis.label.set_color(c["ink"])
-        for spine in canvas.axes.spines.values():
-            spine.set_color(c["line"])
+    # ── Charts ────────────────────────────────────────────────
+    def _chart_tokens(self):
+        return colors_for(self._theme_name)
+
+    def _start_chart(self, canvas):
+        """A fresh axes in the current theme. Called inside chart_rc: new
+        axes take their face, spines and ticks from the rc, which
+        axes.clear() on the old ones would not."""
+        canvas.fig.clear()
+        canvas.fig.set_facecolor(self._chart_tokens()["surface"])
+        canvas.axes = canvas.fig.add_subplot(111)
+        canvas.set_hover(None, {})
+
+    def _empty_chart(self, canvas):
+        t = self._chart_tokens()
+        canvas.axes.set_axis_off()
+        canvas.axes.text(0.5, 0.5, "Chưa có văn bản", ha="center", va="center",
+                         color=t["text_muted"], fontsize=9, transform=canvas.axes.transAxes)
 
     def update_matplotlib_charts(self, urgency, orgs, monthly):
-        """Render 3 charts with Material-pastel palette — modern, soft-eye look.
+        """Draw the three charts in the theme: flat olive bars on the
+        surface, hairline baseline, labels in the text colours, a value at
+        the end of each bar or on the extreme columns only."""
+        with matplotlib.rc_context(chart_rc(self._theme_name)):
+            self._draw_monthly(monthly)
+            self._draw_urgency(urgency)
+            self._draw_orgs(orgs)
 
-        2026-04-18 redesign per user feedback:
-          - Chart 1: Độ khẩn pie (replaces Loại VB). Pastel red→orange→gold
-            →sage sequence conveys urgency hierarchy at a glance.
-          - Chart 2: LINE chart with gradient fill below (replaces bar).
-            Smoother narrative for timeline data; gradient signals "area under".
-          - Chart 3: horizontal bar with pastel olive. Kept top-8 filter +
-            big-on-top ordering for quick scanning.
+    def _draw_monthly(self, monthly):
+        canvas, t = self.monthly_canvas, self._chart_tokens()
+        self._start_chart(canvas)
+        ax = canvas.axes
+        slots = _month_slots(monthly, datetime.now().date())
+        values = [monthly.get("{:04d}-{:02d}".format(y, m), 0) for y, m in slots]
+        if not any(values):
+            self._empty_chart(canvas)
+            canvas.draw_idle()
+            return
+        x = list(range(len(slots)))
+        ax.bar(x, values, width=0.3, color=t["primary_muted"], zorder=2)
+        labels = []
+        for index, (year, month) in enumerate(slots):
+            first = index == 0 or month == 1
+            labels.append("T{}\n{}".format(month, year) if first else "T{}".format(month))
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels)
+        ax.set_xlim(-0.6, len(slots) - 0.4)
+        top = max(values)
+        ax.set_ylim(0, top * 1.2)
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=4, integer=True))
+        ax.grid(axis="y")
+        ax.spines["left"].set_visible(False)
+        # Values on the extremes only: the highest month and the latest one.
+        peak = values.index(top)
+        latest = max(i for i, v in enumerate(values) if v)
+        for index in sorted({peak, latest}):
+            ax.annotate(str(values[index]), (index, values[index]), xytext=(0, 3),
+                        textcoords="offset points", ha="center", va="bottom",
+                        color=t["text_secondary"], fontsize=8.5)
+        canvas.set_hover("x", {
+            index: "Tháng {}/{}: {} văn bản".format(month, year, values[index])
+            for index, (year, month) in enumerate(slots)
+        })
+        canvas.draw_idle()
 
-        Color policy: Material Design inspired, pastel-tinted so charts feel
-        airy on the cream (#FAFAF5) background — not ceremonial-red like
-        before. Brand identity lives in the chrome (title color, CTAs).
-        """
-        c = self._chart_colors
-        line_color = colors_for(self._theme_name)["primary_muted"]
+    def _draw_bars(self, canvas, names, values, colours, hover, slots=4, thickness=0.5):
+        """Horizontal bars, the first name on top, the value at each tip.
+        At least `slots` rows of room, so a short list keeps thin bars."""
+        t = self._chart_tokens()
+        ax = canvas.axes
+        y = list(range(len(names)))
+        ax.barh(y, values, height=thickness, color=colours, zorder=2)
+        ax.set_yticks(y)
+        ax.set_yticklabels(names)
+        ax.set_ylim(max(len(names), slots) - 0.4, -0.6)
+        top = max(values) if values else 0
+        ax.set_xlim(0, (top or 1) * 1.18)
+        ax.xaxis.set_visible(False)
+        ax.spines["bottom"].set_visible(False)
+        for index, value in enumerate(values):
+            ax.annotate(str(value), (value, index), xytext=(4, 0), textcoords="offset points",
+                        ha="left", va="center", color=t["text_secondary"], fontsize=8.5)
+        canvas.set_hover("y", dict(enumerate(hover)))
+        canvas.draw_idle()
 
-        # ── Chart 1: Độ khẩn pie ──
-        self.doc_type_canvas.axes.clear()
-        self._style_chart_axes(self.doc_type_canvas)
-        if urgency:
-            # Preferred order: Hỏa Tốc → Thượng Khẩn → Khẩn → Thường → other
-            order = ["Hỏa Tốc", "Thượng Khẩn", "Khẩn", "Thường"]
-            ordered_items = [(k, urgency[k]) for k in order if urgency.get(k)]
-            for k, v in urgency.most_common():
-                if k not in order:
-                    ordered_items.append((k, v))
-            labels = [k for k, _ in ordered_items]
-            sizes = [v for _, v in ordered_items]
+    def _draw_urgency(self, urgency):
+        canvas, t = self.doc_type_canvas, self._chart_tokens()
+        self._start_chart(canvas)
+        if not urgency:
+            self._empty_chart(canvas)
+            canvas.draw_idle()
+            return
+        # Every NĐ30 level is listed, so "no urgent documents" is visible.
+        names = list(URGENCY_ORDER) + [k for k, _ in urgency.most_common() if k not in URGENCY_ORDER]
+        values = [urgency.get(name, 0) for name in names]
+        level = {"Hỏa tốc": "urgency_hoa_toc", "Thượng khẩn": "urgency_thuong_khan",
+                 "Khẩn": "urgency_khan", "Thường": "primary_muted"}
+        colours = [t[level.get(name, "text_muted")] for name in names]
+        hover = ["{}: {} văn bản".format(name, value) for name, value in zip(names, values)]
+        self._draw_bars(canvas, names, values, colours, hover, thickness=0.36)
 
-            # Pastel palette aligned with urgency semantics
-            urgency_colors = {
-                "Hỏa Tốc":      '#FF6B6B',   # pastel coral — most urgent
-                "Thượng Khẩn":  '#FFA94D',   # pastel peach
-                "Khẩn":         '#FFD93D',   # pastel gold
-                "Thường":       '#A8C4A8',   # pastel sage
-            }
-            default_extra = ['#9BB5D6', '#C4A8D4', '#CED4DA', '#B8B8A8']
-            colors = []
-            extra_idx = 0
-            for lab in labels:
-                if lab in urgency_colors:
-                    colors.append(urgency_colors[lab])
-                else:
-                    colors.append(default_extra[extra_idx % len(default_extra)])
-                    extra_idx += 1
+    def _draw_orgs(self, orgs):
+        canvas, t = self.org_canvas, self._chart_tokens()
+        self._start_chart(canvas)
+        if not orgs:
+            self._empty_chart(canvas)
+            canvas.draw_idle()
+            return
+        top_orgs = orgs.most_common(8)
+        # Long names wrap to two lines; the whole name is in the tooltip.
+        names = []
+        for name, _ in top_orgs:
+            lines = textwrap.wrap(name, 26) or [name]
+            if len(lines) > 2:
+                lines = [lines[0], textwrap.shorten(" ".join(lines[1:]), 26, placeholder="…")]
+            names.append("\n".join(lines))
+        values = [v for _, v in top_orgs]
+        hover = ["{}: {} văn bản".format(name, value) for name, value in top_orgs]
+        self._draw_bars(canvas, names, values, [t["primary_muted"]] * len(values), hover, slots=6)
 
-            wedges, texts, autotexts = self.doc_type_canvas.axes.pie(
-                sizes, labels=labels, autopct='%1.1f%%',
-                colors=colors, startangle=90,
-                textprops={'fontsize': 10, 'color': c['ink']},
-                pctdistance=0.72,
-                wedgeprops={'edgecolor': c['surface'], 'linewidth': 2},
-            )
-            for autotext in autotexts:
-                autotext.set_color(c['ink'])
-                autotext.set_fontweight('bold')
-
-            self.doc_type_canvas.axes.set_title(
-                "Độ khẩn văn bản", fontsize=13, color=c['ink'],
-                fontweight='bold', pad=14,
-            )
-        self.doc_type_canvas.fig.subplots_adjust(top=0.88, bottom=0.06, left=0.06, right=0.94)
-        self.doc_type_canvas.draw()
-
-        # ── Chart 2: Timeline LINE chart với gradient fill ──
-        self.monthly_canvas.axes.clear()
-        self._style_chart_axes(self.monthly_canvas)
-        sorted_months = sorted(monthly.items())[-12:]
-        if sorted_months:
-            months = [m[-7:] for m, v in sorted_months]   # YYYY-MM
-            values = [v for m, v in sorted_months]
-            x = list(range(len(months)))
-
-            # Gradient fill beneath the line — pastel olive
-            self.monthly_canvas.axes.fill_between(
-                x, values, color='#A8C4A8', alpha=0.35, zorder=1,
-            )
-            # Line with data points
-            self.monthly_canvas.axes.plot(
-                x, values,
-                color=line_color, linewidth=2.2, marker='o',
-                markerfacecolor=c['surface'], markeredgecolor=line_color,
-                markersize=6, markeredgewidth=2, zorder=3,
-            )
-            # Annotate peak
-            if values:
-                peak_idx = values.index(max(values))
-                self.monthly_canvas.axes.annotate(
-                    f'{max(values)}',
-                    xy=(peak_idx, max(values)),
-                    xytext=(0, 8), textcoords='offset points',
-                    ha='center', fontsize=10, fontweight='bold',
-                    color=line_color,
-                )
-
-            self.monthly_canvas.axes.set_xticks(x)
-            self.monthly_canvas.axes.set_xticklabels(months)
-            self.monthly_canvas.axes.set_title(
-                "Tần suất văn bản theo thời gian", fontsize=13, color=c['ink'],
-                fontweight='bold', pad=12,
-            )
-            self.monthly_canvas.axes.tick_params(axis='x', rotation=40,
-                                                 labelsize=9, colors=c['muted'])
-            self.monthly_canvas.axes.tick_params(axis='y', labelsize=9, colors=c['muted'])
-            self.monthly_canvas.axes.grid(axis='y', linestyle='--', alpha=0.25, zorder=0)
-            # Clean look — remove top/right spines
-            self.monthly_canvas.axes.spines['top'].set_visible(False)
-            self.monthly_canvas.axes.spines['right'].set_visible(False)
-        self.monthly_canvas.fig.subplots_adjust(top=0.88, bottom=0.25, left=0.10, right=0.96)
-        self.monthly_canvas.draw()
-
-        # ── Chart 3: Cơ quan ban hành horizontal bar (pastel olive) ──
-        self.org_canvas.axes.clear()
-        self._style_chart_axes(self.org_canvas)
-        if orgs:
-            top_orgs = orgs.most_common(8)
-            labels = [(k[:32] + '…') if len(k) > 33 else k for k, v in top_orgs]
-            sizes = [v for k, v in top_orgs]
-
-            # Pastel olive with subtle shade variation (darker = more docs)
-            max_v = max(sizes) if sizes else 1
-            bar_colors = [
-                (0.66 - 0.25 * (v / max_v), 0.77 - 0.15 * (v / max_v),
-                 0.66 - 0.2 * (v / max_v), 0.92)
-                for v in sizes
-            ]
-            self.org_canvas.axes.barh(
-                labels, sizes, color=bar_colors,
-                edgecolor=line_color, linewidth=0.8,
-            )
-            # Value labels at end of bars
-            for i, v in enumerate(sizes):
-                self.org_canvas.axes.text(
-                    v, i, f' {v}',
-                    va='center', fontsize=9, color=c['ink'], fontweight='bold',
-                )
-
-            self.org_canvas.axes.set_title(
-                "Cơ quan ban hành — Top 8", fontsize=13, color=c['ink'],
-                fontweight='bold', pad=12,
-            )
-            self.org_canvas.axes.tick_params(axis='y', labelsize=9, colors=c['ink'])
-            self.org_canvas.axes.tick_params(axis='x', labelsize=9, colors=c['muted'])
-            self.org_canvas.axes.grid(axis='x', linestyle='--', alpha=0.25)
-            self.org_canvas.axes.invert_yaxis()  # biggest on top
-            self.org_canvas.axes.spines['top'].set_visible(False)
-            self.org_canvas.axes.spines['right'].set_visible(False)
-        self.org_canvas.fig.subplots_adjust(top=0.88, bottom=0.12, left=0.30, right=0.94)
-        self.org_canvas.draw()
-    
     def update_simple_charts(self, urgency, orgs, monthly):
         """Fallback when matplotlib missing — pure Qt widgets."""
-        # Chart 1 now shows urgency (not doc types).
-        self.doc_type_chart.set_data(urgency.most_common(6))
-        sorted_months = sorted(monthly.items())[-6:]
-        self.monthly_chart.set_data(sorted_months)
+        self.doc_type_chart.set_data([(k, urgency.get(k, 0)) for k in URGENCY_ORDER])
+        slots = _month_slots(monthly, datetime.now().date())[-6:]
+        self.monthly_chart.set_data(
+            [("T{}".format(m), monthly.get("{:04d}-{:02d}".format(y, m), 0)) for y, m in slots])
         self.org_chart.set_data(orgs.most_common(6))
-    
+
+    # ── Table ─────────────────────────────────────────────────
     def populate_table(self, documents):
-        """Populate result table with numeric ID sort.
-
-        2026-04-18 fix: ID column previously used QTableWidgetItem(str(id))
-        causing lexicographic sort (1, 10, 11, 2, 3…). Switched to
-        `setData(Qt.DisplayRole, int)` so Qt natively compares numerically.
-        """
+        """Fill the table. The ID column holds ints so it sorts numerically;
+        every text is whole (line breaks become spaces) and a long one is
+        also the cell's tooltip, so nothing is cut away for good."""
+        self.results_table.setSortingEnabled(False)
         self.results_table.setRowCount(0)
-
         for doc in documents:
             row = self.results_table.rowCount()
             self.results_table.insertRow(row)
-
-            # Column 0 — ID as INT (numeric sort)
             id_item = QTableWidgetItem()
             try:
                 id_item.setData(Qt.DisplayRole, int(doc[0]))
             except (ValueError, TypeError):
                 id_item.setData(Qt.DisplayRole, str(doc[0]))
             self.results_table.setItem(row, 0, id_item)
-
-            self.results_table.setItem(row, 1, QTableWidgetItem(doc[4] or ""))
-            self.results_table.setItem(row, 2, QTableWidgetItem(doc[5] or ""))
-            self.results_table.setItem(row, 3, QTableWidgetItem(doc[6] or ""))
-            self.results_table.setItem(row, 4, QTableWidgetItem(doc[7] or ""))
-            nd = doc[8] or ""
-            self.results_table.setItem(row, 5,
-                QTableWidgetItem(nd[:80] + "…" if len(nd) > 80 else nd))
-            self.results_table.setItem(row, 6, QTableWidgetItem(doc[2] or ""))
-
-        self.results_count_label.setText(f"Kết quả: {len(documents)} văn bản")
-        # Enable user-click sorting — respects numeric sort for ID column.
+            for column, value in ((1, doc[4]), (2, doc[5]), (3, doc[6]),
+                                  (4, doc[7]), (5, doc[8]), (6, doc[2])):
+                text = value or ""
+                item = QTableWidgetItem(" ".join(text.split()))
+                if len(text) > 18:
+                    item.setToolTip(_tip(text))
+                self.results_table.setItem(row, column, item)
+        self.results_count_label.setText(f"{len(documents)} văn bản")
         self.results_table.setSortingEnabled(True)
-    
+
     def show_all_documents(self):
         """Hiển thị tất cả văn bản"""
         self.populate_table(self.all_documents)
         self.result_tabs.setCurrentIndex(0)
-    
+
     def search_by_date(self):
         """Tìm theo ngày"""
         try:
             date_from = self.date_from.date().toString("yyyy-MM-dd")
             date_to = self.date_to.date().toString("yyyy-MM-dd")
-
             with self.db.conn_pool.get_connection() as conn:
                 results = fetch_latest_documents(
                     conn, date_from=date_from, date_to=date_to
                 )
-            
             self.populate_table(results)
-            self.status_label.setText(f"Tìm thấy {len(results)} văn bản từ {date_from} đến {date_to}")
+            self.status_label.setText(
+                "{} văn bản thêm vào kho từ {} đến {}".format(
+                    len(results), self.date_from.date().toString("dd/MM/yyyy"),
+                    self.date_to.date().toString("dd/MM/yyyy")))
             self.result_tabs.setCurrentIndex(0)
-            
         except Exception as e:
             QMessageBox.warning(self, "Lỗi", f"Lỗi tìm kiếm: {str(e)}")
-    
+
     def search_by_number(self):
         """Tìm theo số ký hiệu"""
         keyword = self.number_input.text().strip()
         if not keyword:
             QMessageBox.warning(self, "Cảnh báo", "Vui lòng nhập số ký hiệu!")
             return
-        
         try:
             with self.db.conn_pool.get_connection() as conn:
                 results = fetch_latest_documents(conn, number=keyword)
-            
             self.populate_table(results)
-            self.status_label.setText(f"Tìm thấy {len(results)} văn bản với số ký hiệu '{keyword}'")
+            self.status_label.setText(f"{len(results)} văn bản có số hiệu chứa “{keyword}”")
             self.result_tabs.setCurrentIndex(0)
-            
         except Exception as e:
             QMessageBox.warning(self, "Lỗi", f"Lỗi tìm kiếm: {str(e)}")
-    
+
     def search_by_content(self):
         """Tìm theo nội dung"""
         keyword = self.content_input.text().strip()
         doc_type = self.doc_type_filter.currentData()
         org = self.org_filter.text().strip()
-        
         try:
             with self.db.conn_pool.get_connection() as conn:
                 results = fetch_latest_documents(
                     conn, keyword=keyword, doc_type=doc_type, org=org
                 )
-            
             self.populate_table(results)
             self.status_label.setText(f"Tìm thấy {len(results)} văn bản")
             self.result_tabs.setCurrentIndex(0)
-            
         except Exception as e:
             QMessageBox.warning(self, "Lỗi", f"Lỗi tìm kiếm: {str(e)}")
-    
+
     def export_report(self):
-        """Xuất báo cáo"""
+        """Save the rows the table shows as CSV (UTF-8 with BOM, for Excel)."""
         try:
             from PyQt5.QtWidgets import QFileDialog
             filepath, _ = QFileDialog.getSaveFileName(
-                self, "Xuất báo cáo", "", "CSV Files (*.csv);;All Files (*)"
+                self, "Xuất bảng kết quả", "", "CSV Files (*.csv);;All Files (*)"
             )
             if filepath:
+                table = self.results_table
+                headers = [table.horizontalHeaderItem(c).text() for c in range(table.columnCount())]
                 with open(filepath, 'w', encoding='utf-8-sig') as f:
-                    f.write("ID,Số ký hiệu,Ngày BH,Loại VB,Cơ quan BH,Nội dung,File\n")
-                    for row in range(self.results_table.rowCount()):
+                    f.write(",".join(headers) + "\n")
+                    for row in range(table.rowCount()):
                         row_data = []
-                        for col in range(self.results_table.columnCount()):
-                            item = self.results_table.item(row, col)
+                        for col in range(table.columnCount()):
+                            item = table.item(row, col)
                             text = item.text() if item else ""
                             text = text.replace('"', '""')
                             row_data.append(f'"{text}"')
                         f.write(",".join(row_data) + "\n")
-                
                 QMessageBox.information(self, "Thành công", f"Đã xuất báo cáo: {filepath}")
         except Exception as e:
             QMessageBox.warning(self, "Lỗi", f"Lỗi xuất báo cáo: {str(e)}")

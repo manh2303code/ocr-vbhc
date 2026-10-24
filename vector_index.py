@@ -10,6 +10,9 @@ import numpy as np
 
 logger = logging.getLogger("VectorIndex")
 EMBEDDING_DIM = 1024
+# float32 BLOB size of one usable embedding; anything else is skipped by
+# _as_vector and must not count as "missing from the index" either.
+_EMBEDDING_BYTES = EMBEDDING_DIM * 4
 
 
 def init_vec(conn) -> bool:
@@ -127,6 +130,47 @@ class VectorIndex:
             np.vstack([by_id[chunk_id][1] for chunk_id in self._ids]).astype(np.float32)
             if by_id else np.empty((0, EMBEDDING_DIM), dtype=np.float32)
         )
+
+    def replace_chunks(self, conn, removed_ids, rows) -> None:
+        """Mirror one chunk rewrite: drop the replaced rowids, index the new.
+
+        Called inside the transaction that rewrote ``document_chunks`` so the
+        two tables commit (or roll back) together.
+        """
+        self.remove_chunks(conn, removed_ids)
+        self.upsert(conn, rows)
+
+    def out_of_sync(self, conn) -> bool:
+        """True when chunk_vectors does not hold exactly the indexable chunks.
+
+        Compares rowid sets, not counts. The live DB had 53 vectors for 107
+        chunks (documents added after the first sync were never indexed),
+        but re-indexing documents that were indexed once leaves as many
+        orphan vectors as it creates unindexed chunks, so the counts of a
+        broken index can match (eval corpus after re-indexing 5 documents:
+        173 = 173 rows, 54 missing and 54 orphans).
+        """
+        if not self._use_native(conn):
+            return False
+        chunk_ids = {
+            int(row[0]) for row in conn.execute(
+                "SELECT id FROM document_chunks "
+                "WHERE embedding IS NOT NULL AND length(embedding) = ?",
+                (_EMBEDDING_BYTES,),
+            )
+        }
+        vector_ids = {
+            int(row[0]) for row in conn.execute("SELECT rowid FROM chunk_vectors")
+        }
+        return chunk_ids != vector_ids
+
+    def ensure_synced(self, conn) -> Optional[int]:
+        """Rebuild the native index if it drifted; returns vectors written."""
+        if not self.out_of_sync(conn):
+            return None
+        count = self.sync_from_chunks(conn)
+        logger.info("chunk_vectors was out of sync; rebuilt %d vectors", count)
+        return count
 
     def remove_chunks(self, conn, chunk_ids) -> None:
         ids = [int(chunk_id) for chunk_id in chunk_ids]

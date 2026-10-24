@@ -33,6 +33,10 @@ logger = logging.getLogger("AISearch")
 # --- Constants ---
 EMBEDDING_MODEL_DIR = Path(__file__).parent / "model_embedding"
 EMBEDDING_DIM = 1024
+# The model was trained on sequences of at most 2048 tokens
+# (model_embedding/README.md); positions past that were never tuned. A chunk
+# is about 470 XLM-R tokens (max 816 on the eval corpus).
+EMBEDDING_MAX_TOKENS = 2048
 MAX_RESULTS = 10
 MAX_TEXT_CHARS = 16000  # legacy, dùng cho build_embedding_text
 
@@ -317,7 +321,7 @@ class EmbeddingModel:
                 local_files_only=True,
                 device=preferred_torch_device(),
             )
-            self.model.max_seq_length = 4096
+            self.model.max_seq_length = EMBEDDING_MAX_TOKENS
             self._is_loaded = True
             logger.info(f"Đã load embedding model từ {self.model_dir}")
             return True
@@ -454,24 +458,44 @@ class VectorStore:
         Args:
             doc_id: document ID
             chunks: List[(chunk_text, embedding_vector, page_number)]
+
+        The sqlite-vec index (chunk_vectors) is updated in the same
+        transaction: the replaced rowids are removed and the new ones
+        indexed. Without this, chunks written after OCR, re-OCR or a manual
+        edit were invisible to vector search until a full reindex.
         """
+        from vector_index import VectorIndex
+
         with closing(sqlite3.connect(self.db_path)) as conn, conn:
+            old_ids = [
+                row[0] for row in conn.execute(
+                    'SELECT id FROM document_chunks WHERE document_id = ?',
+                    (doc_id,),
+                )
+            ]
             # Xóa chunks cũ
             conn.execute(
                 'DELETE FROM document_chunks WHERE document_id = ?',
                 (doc_id,),
             )
             # Insert chunks mới
+            new_rows = []
             for idx, (text, embedding, page_number) in enumerate(chunks):
                 blob = embedding.tobytes()
                 text_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
-                conn.execute(
+                cursor = conn.execute(
                     '''INSERT INTO document_chunks
                         (document_id, chunk_index, chunk_text, embedding,
                          page_number, text_hash, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)''',
                     (doc_id, idx, text, blob, page_number, text_hash),
                 )
+                new_rows.append((cursor.lastrowid, blob))
+            index = VectorIndex(conn)
+            # The NumPy fallback keeps its matrix in memory per search
+            # surface and reloads it from document_chunks there.
+            if index.is_native():
+                index.replace_chunks(conn, old_ids, new_rows)
             conn.commit()
 
     def get_all_chunk_embeddings(self) -> List[Tuple[int, int, np.ndarray]]:

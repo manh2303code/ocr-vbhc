@@ -12,13 +12,51 @@ from typing import Optional
 
 import httpx
 
+import app_config
 from app_config import (
     get_llama_server_exe, get_llama_bin_dir, get_model_path, get_mmproj_path,
     select_backend, LLAMA_SERVER_PORT, LLAMA_SERVER_HOST, LLAMA_SERVER_URL,
-    LLAMA_FLASH_ATTN, OCR_MODELS, ACTIVE_OCR_MODEL,
+    ACTIVE_OCR_MODEL,
 )
 
 logger = logging.getLogger("LlamaServer")
+
+
+def build_server_command(server_exe: Path, model_path: Path, mmproj_path: Path,
+                         port: int, backend: str, parallel_slots: int = 1,
+                         model_key: Optional[str] = None) -> list:
+    """llama-server argv for the Chandra OCR server.
+
+    ``parallel_slots`` must equal the number of OCR workers that send pages
+    concurrently: each worker then owns a slot with its own context instead
+    of sharing one pool (app_config.ocr_server_context_args).
+    """
+    threads = str(min(8, os.cpu_count() or 4))
+    cmd = [
+        str(server_exe),
+        "-m", str(model_path),
+        "--mmproj", str(mmproj_path),
+        "--port", str(port),
+        "--host", LLAMA_SERVER_HOST,
+    ]
+    cmd.extend(app_config.ocr_server_context_args(parallel_slots, model_key))
+    cmd.extend(["-t", threads])
+
+    # Leaves any <think> block inside message.content (it does NOT remove
+    # reasoning); llama_ocr strips it, and requests disable thinking.
+    cmd.extend(["--reasoning-format", "none"])
+
+    if backend == "cuda":
+        cmd.extend(["-ngl", "99"])  # offload all layers to GPU
+    else:
+        # CPU-only mode: explicitly disable GPU offload.
+        # Benchmark 2026-04-17: Chandra Q4 CPU ~90s/page at 8 threads.
+        # Using more threads than physical cores hurts due to cache thrash.
+        cmd.extend(["-ngl", "0"])
+
+    if app_config.LLAMA_FLASH_ATTN:
+        cmd.extend(["--flash-attn", "auto"])
+    return cmd
 
 
 class LlamaServerManager:
@@ -93,7 +131,7 @@ class LlamaServerManager:
         return killed
 
     def start(self, timeout: float = 60.0, backend: Optional[str] = None,
-              model_key: Optional[str] = None) -> None:
+              model_key: Optional[str] = None, parallel_slots: int = 1) -> None:
         """Start llama-server and wait until healthy.
 
         Args:
@@ -101,6 +139,7 @@ class LlamaServerManager:
             backend: 'cuda' or 'cpu'. Auto-detected if None.
             model_key: OCR model profile from app_config.OCR_MODELS.
                        Defaults to ACTIVE_OCR_MODEL.
+            parallel_slots: concurrent OCR workers the server must serve.
         """
         if self.is_running:
             logger.info("llama-server already running on port %d", self._port)
@@ -135,32 +174,13 @@ class LlamaServerManager:
         logger.info(f"Model:  {model_path} ({model_path.stat().st_size / 1024**2:.0f}MB)")
         logger.info(f"MMProj: {mmproj_path}")
 
-        ctx_size = OCR_MODELS.get(key, {}).get("ctx_size", 8192)
-        cmd = [
-            str(server_exe),
-            "-m", str(model_path),
-            "--mmproj", str(mmproj_path),
-            "--port", str(self._port),
-            "--host", LLAMA_SERVER_HOST,
-            "-c", str(ctx_size),
-            "-t", str(min(8, os.cpu_count() or 4)),
-        ]
-
-        # Chandra (Qwen 3.5): keep reasoning tokens out of the response.
-        cmd.extend(["--reasoning-format", "none"])
-
-        if self._backend == "cuda":
-            cmd.extend(["-ngl", "99"])  # offload all layers to GPU
-        else:
-            # CPU-only mode: explicitly disable GPU offload + increase threads.
-            # Benchmark 2026-04-17: Chandra Q4 CPU ~90s/page at 8 threads.
-            # Using more threads than physical cores hurts due to cache thrash.
-            cmd.extend(["-ngl", "0"])
-            cmd[cmd.index("-t") + 1] = str(min(8, os.cpu_count() or 4))
-            logger.info(f"[CPU mode] ngl=0, threads={cmd[cmd.index('-t')+1]}")
-
-        if LLAMA_FLASH_ATTN:
-            cmd.extend(["--flash-attn", "auto"])
+        cmd = build_server_command(
+            server_exe, model_path, mmproj_path, self._port, self._backend,
+            parallel_slots=parallel_slots, model_key=key,
+        )
+        logger.info("OCR server context: %s", " ".join(
+            app_config.ocr_server_context_args(parallel_slots, key)
+        ))
 
         # Environment with DLL paths
         env = os.environ.copy()

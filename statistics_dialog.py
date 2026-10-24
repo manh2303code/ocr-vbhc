@@ -1,13 +1,61 @@
-# Trong statistics_dialog.py
-from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTableWidget, 
-                           QTableWidgetItem, QGroupBox, QLabel, QPushButton, 
-                           QHeaderView, QTabWidget, QWidget, QFileDialog, QMessageBox)
+"""Statistics dialog: counts of the store by type, urgency and month.
+
+2026-10 minimal redesign: one sheet with text tabs; the total is a figure,
+not a bold sentence; the tables are hairline lists without a row-number
+column; urgency levels are written in their NĐ30 token colour instead of
+filled cells (the empty mark and "Không" are one level, "Thường"). Styled by
+the "analytics" area of the theme stylesheet (objectNames statistics*); the
+urgency colours come from theme_tokens and follow a live theme switch.
+"""
+from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTableWidget,
+                             QTableWidgetItem, QLabel, QPushButton,
+                             QHeaderView, QTabWidget, QWidget, QFileDialog, QMessageBox,
+                             QFrame)
 from PyQt5.QtCore import Qt
-from PyQt5.QtGui import QColor
+from PyQt5.QtGui import QColor, QFont
 import pandas as pd
 import logging
 
+from analytics_queries import URGENCY_ORDER, urgency_label
+from theme_manager_v2 import ThemeManager
+from theme_tokens import colors_for
+
 logger = logging.getLogger("OCRApp")
+
+# NĐ30 urgency level -> the token that colours it (as in "Thông tin tệp").
+_URGENCY_TOKENS = {
+    "Hỏa tốc": "urgency_hoa_toc",
+    "Thượng khẩn": "urgency_thuong_khan",
+    "Khẩn": "urgency_khan",
+}
+
+
+def _table(headers, numeric_column=None):
+    table = QTableWidget()
+    table.setObjectName("statisticsTable")
+    table.setColumnCount(len(headers))
+    table.setHorizontalHeaderLabels(headers)
+    table.verticalHeader().setVisible(False)
+    table.verticalHeader().setDefaultSectionSize(26)
+    table.setEditTriggers(QTableWidget.NoEditTriggers)
+    table.setSelectionBehavior(QTableWidget.SelectRows)
+    table.setAlternatingRowColors(True)
+    table.setShowGrid(False)
+    table.setFrameShape(QFrame.NoFrame)
+    table.setWordWrap(False)
+    header = table.horizontalHeader()
+    header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+    header.setHighlightSections(False)
+    if numeric_column is not None:
+        table.horizontalHeaderItem(numeric_column).setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    return table
+
+
+def _number(value):
+    item = QTableWidgetItem(str(value))
+    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    return item
+
 
 class StatisticsDialog(QDialog):
     """Dialog hiển thị thống kê"""
@@ -15,94 +63,114 @@ class StatisticsDialog(QDialog):
     def __init__(self, db, parent=None):
         super().__init__(parent)
         self.db = db
+        self._theme = ThemeManager.instance().current
         self.setup_ui()
         self.load_statistics()
+        ThemeManager.instance().theme_changed.connect(self.apply_theme)
 
     def setup_ui(self):
-        self.setWindowTitle("Thống kê hệ thống")
+        self.setObjectName("statisticsDialog")
+        self.setWindowTitle("Thống kê kho văn bản")
         self.setMinimumWidth(800)
         self.setMinimumHeight(600)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        # Tab widget chính
         self.tab_widget = QTabWidget()
-        
-        # Tab tổng quan
+        self.tab_widget.setObjectName("statisticsTabs")
+
+        # Overview: the total, then the two breakdowns side by side.
         overview_tab = QWidget()
+        overview_tab.setObjectName("statisticsPage")
         overview_layout = QVBoxLayout(overview_tab)
-        
-        # Tổng quát
-        overview_group = QGroupBox("Thông tin tổng quan")
-        overview_group_layout = QVBoxLayout()
-        self.total_label = QLabel()
-        self.total_label.setStyleSheet("font-size: 14px; font-weight: bold;")
-        overview_group_layout.addWidget(self.total_label)
-        overview_group.setLayout(overview_group_layout)
-        overview_layout.addWidget(overview_group)
-        
-        # Thống kê theo loại
-        type_group = QGroupBox("Thống kê theo loại văn bản")
-        type_layout = QVBoxLayout()
-        self.type_table = QTableWidget()
-        self.type_table.setColumnCount(2)
-        self.type_table.setHorizontalHeaderLabels(["Loại văn bản", "Số lượng"])
+        overview_layout.setContentsMargins(20, 16, 20, 16)
+        overview_layout.setSpacing(16)
+
+        total_box = QVBoxLayout()
+        total_box.setSpacing(0)
+        total_caption = QLabel("Tổng số văn bản")
+        total_caption.setObjectName("stat_title")
+        total_box.addWidget(total_caption)
+        self.total_label = QLabel("0")
+        self.total_label.setObjectName("stat_value")
+        total_box.addWidget(self.total_label)
+        overview_layout.addLayout(total_box)
+
+        columns = QHBoxLayout()
+        columns.setSpacing(24)
+        self.type_table = _table(["Loại văn bản", "Số lượng"], numeric_column=1)
         self.type_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.type_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        type_layout.addWidget(self.type_table)
-        type_group.setLayout(type_layout)
-        overview_layout.addWidget(type_group)
-        
-        # Thống kê độ khẩn
-        urgency_group = QGroupBox("Thống kê theo độ khẩn")
-        urgency_layout = QVBoxLayout()
-        self.urgency_table = QTableWidget()
-        self.urgency_table.setColumnCount(2)
-        self.urgency_table.setHorizontalHeaderLabels(["Độ khẩn", "Số lượng"])
+        columns.addLayout(self._section("Theo loại văn bản", self.type_table), 1)
+        self.urgency_table = _table(["Độ khẩn", "Số lượng"], numeric_column=1)
         self.urgency_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.urgency_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        urgency_layout.addWidget(self.urgency_table)
-        urgency_group.setLayout(urgency_layout)
-        overview_layout.addWidget(urgency_group)
-        
+        self.urgency_table.setToolTip("Văn bản không ghi độ khẩn được tính là Thường")
+        columns.addLayout(self._section("Theo độ khẩn", self.urgency_table), 1)
+        overview_layout.addLayout(columns, 1)
         self.tab_widget.addTab(overview_tab, "Tổng quan")
-        
-        # Tab văn bản mới
-        recent_tab = QWidget()
-        recent_layout = QVBoxLayout(recent_tab)
-        self.recent_table = QTableWidget()
-        self.recent_table.setColumnCount(4)
-        self.recent_table.setHorizontalHeaderLabels(["ID", "Tên file", "Ngày tạo", "Số ký hiệu"])
+
+        self.recent_table = _table(["ID", "Tên tệp", "Thêm vào kho", "Số hiệu"])
         self.recent_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        recent_layout.addWidget(self.recent_table)
-        self.tab_widget.addTab(recent_tab, "Văn bản mới nhất")
-        
-        # Tab thống kê thời gian
-        time_tab = QWidget()
-        time_layout = QVBoxLayout(time_tab)
-        self.time_table = QTableWidget()
-        self.time_table.setColumnCount(2)
-        self.time_table.setHorizontalHeaderLabels(["Tháng", "Số lượng"])
+        self.recent_table.setColumnWidth(0, 56)
+        self.recent_table.setColumnWidth(2, 140)
+        self.recent_table.setColumnWidth(3, 150)
+        self.tab_widget.addTab(self.recent_table, "Văn bản mới nhất")
+
+        self.time_table = _table(["Tháng", "Số lượng"], numeric_column=1)
         self.time_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        time_layout.addWidget(self.time_table)
-        self.tab_widget.addTab(time_tab, "Thống kê theo thời gian")
-        
-        layout.addWidget(self.tab_widget)
-        
-        # Nút điều khiển
-        button_box = QHBoxLayout()
-        
-        self.export_btn = QPushButton("Xuất báo cáo")
+        self.time_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.time_table.setToolTip("Số văn bản thêm vào kho mỗi tháng, mười hai tháng gần nhất")
+        self.tab_widget.addTab(self.time_table, "Theo tháng")
+
+        layout.addWidget(self.tab_widget, 1)
+
+        footer = QFrame()
+        footer.setObjectName("statisticsFooter")
+        button_box = QHBoxLayout(footer)
+        button_box.setContentsMargins(16, 10, 16, 12)
+        button_box.setSpacing(8)
+
+        self.export_btn = QPushButton("Xuất Excel")
+        self.export_btn.setProperty("variant", "primary")
+        self.export_btn.setToolTip("Lưu các bảng thống kê ra một tệp Excel")
         self.export_btn.clicked.connect(self.export_statistics)
-        
+
         self.close_btn = QPushButton("Đóng")
         self.close_btn.clicked.connect(self.close)
-        
+
         button_box.addStretch()
-        button_box.addWidget(self.export_btn)
         button_box.addWidget(self.close_btn)
-        
-        layout.addLayout(button_box)
+        button_box.addWidget(self.export_btn)
+        layout.addWidget(footer)
+
+    @staticmethod
+    def _section(title, table):
+        box = QVBoxLayout()
+        box.setSpacing(6)
+        label = QLabel(title)
+        label.setProperty("role", "statisticsSection")
+        box.addWidget(label)
+        box.addWidget(table, 1)
+        return box
+
+    def apply_theme(self, name):
+        """Recolour the urgency levels; the rest follows the stylesheet."""
+        self._theme = "dark" if name == "dark" else "light"
+        self._colour_urgency()
+
+    def _colour_urgency(self):
+        tokens = colors_for(self._theme)
+        for row in range(self.urgency_table.rowCount()):
+            item = self.urgency_table.item(row, 0)
+            token = _URGENCY_TOKENS.get(item.text()) if item else None
+            if token:
+                item.setForeground(QColor(tokens[token]))
+                font = QFont(item.font())
+                font.setWeight(QFont.DemiBold)
+                item.setFont(font)
 
     def load_statistics(self):
         """Load thống kê từ database"""
@@ -110,40 +178,54 @@ class StatisticsDialog(QDialog):
         if not stats:
             return
 
-        # Cập nhật tổng quan
-        self.total_label.setText(f"Tổng số văn bản: {stats['total_documents']}")
+        self.total_label.setText(str(stats['total_documents']))
 
-        # Cập nhật bảng loại văn bản
         self.type_table.setRowCount(len(stats['by_type']))
         for i, (type_name, count) in enumerate(stats['by_type']):
             self.type_table.setItem(i, 0, QTableWidgetItem(type_name or "Không xác định"))
-            self.type_table.setItem(i, 1, QTableWidgetItem(str(count)))
+            self.type_table.setItem(i, 1, _number(count))
 
-        # Cập nhật bảng độ khẩn
-        self.urgency_table.setRowCount(len(stats['by_urgency']))
-        for i, (urgency, count) in enumerate(stats['by_urgency']):
-            item = QTableWidgetItem(urgency or "Không")
-            if urgency == "Độ Mật":
-                item.setBackground(QColor(255, 200, 200))
-            elif urgency == "Hỏa Tốc":
-                item.setBackground(QColor(255, 140, 0))
-                item.setForeground(QColor(255, 255, 255))
-            self.urgency_table.setItem(i, 0, item)
-            self.urgency_table.setItem(i, 1, QTableWidgetItem(str(count)))
+        # One row per level, most urgent first; empty and "Không" are Thường.
+        levels = {}
+        for urgency, count in stats['by_urgency']:
+            name = urgency_label(urgency)
+            levels[name] = levels.get(name, 0) + count
+        order = [name for name in URGENCY_ORDER if name in levels]
+        order += [name for name in levels if name not in URGENCY_ORDER]
+        self.urgency_table.setRowCount(len(order))
+        for i, name in enumerate(order):
+            self.urgency_table.setItem(i, 0, QTableWidgetItem(name))
+            self.urgency_table.setItem(i, 1, _number(levels[name]))
+        self._colour_urgency()
 
-        # Cập nhật văn bản mới nhất
         self.recent_table.setRowCount(len(stats['recent_docs']))
         for i, (doc_id, filename, created_at, so_kh) in enumerate(stats['recent_docs']):
             self.recent_table.setItem(i, 0, QTableWidgetItem(str(doc_id)))
-            self.recent_table.setItem(i, 1, QTableWidgetItem(filename))
-            self.recent_table.setItem(i, 2, QTableWidgetItem(str(created_at)))
+            name = QTableWidgetItem(filename)
+            name.setToolTip(filename or "")
+            self.recent_table.setItem(i, 1, name)
+            self.recent_table.setItem(i, 2, QTableWidgetItem(self._added(created_at)))
             self.recent_table.setItem(i, 3, QTableWidgetItem(so_kh))
 
-        # Cập nhật thống kê theo thời gian
         self.time_table.setRowCount(len(stats['by_month']))
         for i, (month, count) in enumerate(stats['by_month']):
-            self.time_table.setItem(i, 0, QTableWidgetItem(month))
-            self.time_table.setItem(i, 1, QTableWidgetItem(str(count)))
+            self.time_table.setItem(i, 0, QTableWidgetItem(self._month(month)))
+            self.time_table.setItem(i, 1, _number(count))
+
+    @staticmethod
+    def _added(value):
+        """'2026-10-15 09:55:02' as 15/10/2026 09:55, like the rest of the app."""
+        text = str(value or "")
+        if len(text) >= 16 and text[4] == "-" and text[7] == "-":
+            return "{}/{}/{} {}".format(text[8:10], text[5:7], text[:4], text[11:16])
+        return text
+
+    @staticmethod
+    def _month(value):
+        text = str(value or "")
+        if len(text) == 7 and text[4] == "-":
+            return "Tháng {}/{}".format(int(text[5:7]), text[:4])
+        return text
 
     def export_statistics(self):
         """Xuất thống kê ra file Excel"""

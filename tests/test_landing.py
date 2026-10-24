@@ -20,7 +20,12 @@ LANDING = ROOT / "frontend" / "landing"
 
 
 class LandingSnapshotTests(unittest.TestCase):
-    def test_snapshot_is_read_only_and_returns_five_newest_documents(self):
+    def test_snapshot_is_read_only_and_returns_the_newest_documents(self):
+        """An older database without nd_chinh still lists its documents.
+
+        The home page is a register of recent documents now, eight rows (it
+        was five tiles); the schema here predates the NĐ30 summary column.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             db_path = root / "documents.db"
@@ -41,7 +46,7 @@ class LandingSnapshotTests(unittest.TestCase):
                     CREATE TABLE document_chunks (id INTEGER PRIMARY KEY);
                     """
                 )
-                for doc_id in range(1, 8):
+                for doc_id in range(1, 11):
                     conn.execute(
                         "INSERT INTO documents VALUES (?, ?, ?, ?)",
                         (doc_id, f"van-ban-{doc_id}.pdf", f"2026-07-{doc_id:02d}", doc_id),
@@ -61,14 +66,74 @@ class LandingSnapshotTests(unittest.TestCase):
                 theme_getter=lambda: "dark",
             ).get_snapshot()
 
-            self.assertEqual(7, snapshot["documentCount"])
+            self.assertEqual(10, snapshot["documentCount"])
             self.assertEqual(3, snapshot["chunkCount"])
-            self.assertEqual([7, 6, 5, 4, 3], [item["id"] for item in snapshot["recentDocuments"]])
+            self.assertEqual(
+                [10, 9, 8, 7, 6, 5, 4, 3], [item["id"] for item in snapshot["recentDocuments"]]
+            )
+            self.assertEqual("", snapshot["recentDocuments"][0]["summary"])
+            # A bare date is not a timestamp: it passes through unconverted.
+            self.assertEqual("2026-07-10", snapshot["recentDocuments"][0]["updatedAt"])
             self.assertEqual("dark", snapshot["theme"])
             self.assertTrue(snapshot["offline"])
 
             with closing(sqlite3.connect(db_path)) as conn:
-                self.assertEqual(7, conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
+                self.assertEqual(10, conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
+
+    def test_snapshot_carries_the_summary_and_local_time(self):
+        """The register shows số hiệu | trích yếu | cập nhật | trang.
+
+        last_modified is SQLite CURRENT_TIMESTAMP, i.e. UTC; shown raw it read
+        seven hours early in Việt Nam, so the snapshot sends local time.
+        """
+        from datetime import datetime, timezone
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "documents.db"
+            with closing(sqlite3.connect(db_path)) as conn:
+                conn.executescript(
+                    """
+                    CREATE TABLE documents (
+                        id INTEGER PRIMARY KEY, file_name TEXT,
+                        last_modified TEXT, page_count INTEGER
+                    );
+                    CREATE TABLE document_versions (
+                        document_id INTEGER, version_number INTEGER,
+                        so_ki_hieu TEXT, nd_chinh TEXT
+                    );
+                    INSERT INTO documents VALUES (1, 'kh-12.pdf', '2026-10-16 04:48:39', 4);
+                    INSERT INTO document_versions VALUES (1, 1, '11/KH-UBND', 'Bản nháp');
+                    INSERT INTO document_versions VALUES
+                        (1, 2, ' 12/KH-UBND ', 'Kế hoạch tổ chức
+                         hội nghị tổng kết');
+                    """
+                )
+                conn.commit()
+
+            snapshot = LandingSnapshotService(db_path, base_dir=Path(tmp)).get_snapshot()
+
+        doc = snapshot["recentDocuments"][0]
+        self.assertEqual("12/KH-UBND", doc["symbol"])
+        self.assertEqual("Kế hoạch tổ chức hội nghị tổng kết", doc["summary"])
+        self.assertEqual("kh-12.pdf", doc["title"])
+        self.assertEqual(4, doc["pageCount"])
+        expected = datetime(2026, 10, 16, 4, 48, 39, tzinfo=timezone.utc).astimezone()
+        self.assertEqual(expected.strftime("%Y-%m-%dT%H:%M:%S"), doc["updatedAt"])
+
+    def test_every_action_has_a_tooltip_from_the_snapshot(self):
+        """Guidance is one hover away, not printed: each action's hint and
+        shortcut travel in the snapshot, for the page and the fallback."""
+        with tempfile.TemporaryDirectory() as tmp:
+            commands = LandingSnapshotService(
+                Path(tmp) / "missing.db", base_dir=Path(tmp)
+            ).get_snapshot()["commands"]
+        self.assertEqual(
+            {"open_file", "open_files", "import_folder", "open_library", "open_chat"},
+            {spec["action"] for spec in commands},
+        )
+        for spec in commands:
+            self.assertTrue(spec["hint"], spec["action"])
+            self.assertTrue(spec["label"], spec["action"])
 
     def test_missing_database_returns_safe_empty_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -125,23 +190,81 @@ class LandingAssetTests(unittest.TestCase):
         self.assertIn('../../assets/app_icon_256.png', index)
         self.assertNotIn('>OV<', index)
         self.assertTrue((ROOT / "assets" / "app_icon_256.png").is_file())
-        for relative in ("landing.css", "landing.js", "vendor/gsap.min.js"):
+        for relative in ("landing.css", "landing.js"):
             self.assertTrue((LANDING / relative).is_file(), relative)
+        # GSAP drove the load-time entrance the brief removed; nothing loads
+        # it any more, so it is no longer shipped or verified.
+        self.assertFalse((LANDING / "vendor").exists())
+        self.assertNotIn("gsap", (ROOT / "verify.bat").read_text(encoding="utf-8-sig").lower())
         shell = (ROOT / "landing_page.py").read_text(encoding="utf-8")
         self.assertIn("downloadRequested.connect", shell)
         self.assertIn("LocalContentCanAccessRemoteUrls", shell)
 
-    def test_actions_use_pointer_3d_highlight_without_a_fixed_primary_card(self):
+    def test_one_primary_action_and_no_motion_on_load(self):
+        """The 2026-10 brief: one filled button per view, motion only in
+        answer to the user. This replaced five identical cards that tilted in
+        3D under the pointer and a GSAP entrance — the generated look the
+        user rejected — so the old pins on perspective/pointermove are gone.
+        """
         index = (LANDING / "index.html").read_text(encoding="utf-8")
         styles = (LANDING / "landing.css").read_text(encoding="utf-8")
         script = (LANDING / "landing.js").read_text(encoding="utf-8")
-        self.assertNotIn("action-primary", index)
-        self.assertNotIn(":focus-visible", styles)
-        self.assertIn("perspective:", styles)
-        self.assertIn("transform-style:preserve-3d", styles)
-        self.assertIn(".action.is-hovered", styles)
-        self.assertIn('addEventListener("pointermove"', script)
-        self.assertIn('style.setProperty("--rotate-x"', script)
+        primaries = re.findall(r'<button class="btn btn-primary"[^>]*>', index)
+        self.assertEqual(1, len(primaries))
+        self.assertIn('data-action="open_file"', primaries[0])
+        for needle in ("perspective", "preserve-3d", "@keyframes", "animation:"):
+            self.assertNotIn(needle, styles)
+        for needle in ("pointermove", "gsap", "rotate-x"):
+            self.assertNotIn(needle, script)
+        self.assertNotIn("gsap", index)
+
+    def test_page_avoids_what_chromium_83_lacks(self):
+        """QtWebEngine 5.15.2 is Chromium 83. A selector it cannot parse
+        drops the whole rule: `.a:hover,.a:focus-visible{}` lost the hover
+        too, which is why :focus-visible was banned from the start (focus
+        rings use :focus, hidden after pointer input via html[data-input]).
+        Flex `gap` (84) silently did nothing — the old cards' icons touched
+        their labels — so spacing here comes from grid; the rest arrived in
+        85-92 and would fail just as quietly.
+        """
+        styles = (LANDING / "landing.css").read_text(encoding="utf-8")
+        script = (LANDING / "landing.js").read_text(encoding="utf-8")
+        for needle in (":focus-visible", ":is(", ":where(", ":has(", "inset:",
+                       "aspect-ratio", "padding-inline:", "margin-inline:",
+                       "padding-block:", "margin-block:", "display:flex",
+                       "display:inline-flex"):
+            self.assertNotIn(needle, styles)
+        for needle in ("replaceChildren", ".replaceAll(", ".at(", "??=", "||=", "&&="):
+            self.assertNotIn(needle, script)
+
+    def test_page_follows_the_brief_typography(self):
+        """Sentence case, no eyebrow labels, no "A · B" meta strings, no
+        arrows on buttons; document values (số hiệu, trích yếu) in Times
+        New Roman, chrome in Be Vietnam Pro."""
+        index = (LANDING / "index.html").read_text(encoding="utf-8")
+        styles = (LANDING / "landing.css").read_text(encoding="utf-8")
+        script = (LANDING / "landing.js").read_text(encoding="utf-8")
+        for source in (index, script):
+            self.assertNotIn("·", source)
+            self.assertNotIn("→", source)
+        self.assertNotIn("eyebrow", index + styles)
+        self.assertNotIn("uppercase", styles)
+        self.assertNotIn("letter-spacing", styles)
+        visible = re.sub(r"<[^>]+>", " ", index.split("<body>", 1)[1])
+        shouting = {w for w in re.findall(r"\b[^\W\d_]{4,}\b", visible) if w.isupper()}
+        self.assertEqual({"VBHC"}, shouting)  # the product name, nothing else
+        self.assertIn('"Times New Roman"', styles)
+
+    def test_keyboard_shortcuts_follow_the_catalogue(self):
+        """The page answers each action's shortcut from snapshot.commands, so
+        F9 and Ctrl+Shift+K work here as in the workspace; the three file
+        shortcuts stay as defaults if a snapshot ever arrives without them."""
+        script = (LANDING / "landing.js").read_text(encoding="utf-8")
+        for action, shortcut in (("open_file", "Ctrl+O"), ("open_files", "Ctrl+Shift+O"),
+                                 ("import_folder", "Ctrl+Alt+O")):
+            self.assertIn('{}: "{}"'.format(action, shortcut), script)
+        self.assertIn("matches(event, shortcuts[name])", script)
+        self.assertIn("aria-keyshortcuts", script)
 
     def test_home_replaces_command_palette_with_product_information(self):
         index = (LANDING / "index.html").read_text(encoding="utf-8")
@@ -154,7 +277,7 @@ class LandingAssetTests(unittest.TestCase):
         self.assertNotIn("BÀN BẮT ĐẦU VIỆC", index)
         self.assertNotIn("Hoàn toàn ngoại tuyến", index)
         self.assertIn("offline-icon", index)
-        self.assertNotIn("agency-mark", index)
+        self.assertIn('class="emblem" src="../../assets/app_icon_256.png"', index)
         self.assertIn("id=\"info-button\"", index)
         self.assertIn("Trần Hậu Mạnh", index)
         self.assertIn("Chandra", index)
@@ -184,6 +307,62 @@ class LandingFallbackTests(unittest.TestCase):
         self.assertEqual([("open_file", {})], received)
         self.assertIn("65%", window._fallback._status.text())
         window.close()
+
+    def test_native_fallback_follows_the_theme_from_tokens(self):
+        """It was a light-only stylesheet of hand-written hex; it now builds
+        from theme_tokens for whichever theme the snapshot names."""
+        from theme_tokens import COLORS, DARK_COLORS
+
+        for theme, palette in (("light", COLORS), ("dark", DARK_COLORS)):
+            window = LandingWindow(lambda: {"theme": theme}, force_native=True)
+            sheet = window._fallback.styleSheet()
+            self.assertIn("background: {}".format(palette["bg"]), sheet)
+            self.assertIn("background: {}".format(palette["primary"]), sheet)
+            window.close()
+        source = (ROOT / "landing_page.py").read_text(encoding="utf-8")
+        self.assertEqual([], re.findall(r"#[0-9A-Fa-f]{6}\b", source))
+        self.assertNotIn("·", source)
+
+    def test_native_fallback_lists_the_register_and_opens_a_document(self):
+        from PyQt5.QtWidgets import QTreeWidget
+
+        snapshot = {
+            "recentDocuments": [
+                {"id": 7, "symbol": "12/KH-UBND", "summary": "Kế hoạch hội nghị",
+                 "title": "kh.pdf", "pageCount": 4, "updatedAt": "2026-10-16T11:48:39"},
+                {"id": 3, "symbol": "", "summary": "", "title": "scan-03.pdf",
+                 "pageCount": 0, "updatedAt": "2026-09-02"},
+            ],
+        }
+        window = LandingWindow(lambda: snapshot, force_native=True)
+        received = []
+        window.action_requested.connect(lambda action, payload: received.append((action, payload)))
+        rows = window._fallback.findChild(QTreeWidget, "registerRows")
+        self.assertEqual(2, rows.topLevelItemCount())
+        first, second = rows.topLevelItem(0), rows.topLevelItem(1)
+        self.assertEqual(["12/KH-UBND", "Kế hoạch hội nghị", "4"],
+                         [first.text(0), first.text(1), first.text(3)])
+        self.assertEqual("scan-03.pdf", second.text(1))
+        self.assertEqual("02/09/2026", second.text(2))
+        self.assertIn("kh.pdf", first.toolTip(1))
+        rows.itemClicked.emit(first, 1)
+        self.assertEqual([("open_recent", {"docId": 7})], received)
+        window.close()
+
+    def test_stamps_read_like_the_page(self):
+        from datetime import date
+
+        from landing_page import describe_stamp
+
+        today = date(2026, 10, 16)
+        self.assertEqual(("Hôm nay 11:48", "16/10/2026 11:48"),
+                         describe_stamp("2026-10-16T11:48:39", today))
+        self.assertEqual(("Hôm qua 23:05", "15/10/2026 23:05"),
+                         describe_stamp("2026-10-15T23:05:00", today))
+        self.assertEqual(("02/09/2026", "02/09/2026 08:00"),
+                         describe_stamp("2026-09-02T08:00:00", today))
+        self.assertEqual(("02/09/2026", "02/09/2026"), describe_stamp("2026-09-02", today))
+        self.assertEqual(("", ""), describe_stamp(None, today))
 
 
 if __name__ == "__main__":
@@ -237,6 +416,44 @@ class BridgeSignalCoverageTests(unittest.TestCase):
         self.assertIn(
             "--gold:{}".format(COLORS["accent_gold"].lower()), styles.lower()
         )
+
+    # landing.css variable -> theme_tokens key. Olive as text is the fill
+    # in light, primary_muted in dark (see DARK_COLORS).
+    TOKEN_MAP = {
+        "paper": "bg", "surface": "surface", "soft": "surface_alt",
+        "hover": "surface_hover", "pressed": "surface_pressed",
+        "line": "border", "line-strong": "border_strong",
+        "ink": "text", "muted": "text_secondary", "faint": "text_muted",
+        "olive": "primary", "olive-hover": "primary_hover",
+        "olive-soft": "primary_soft", "on-olive": "text_on_primary",
+        "gold": "accent_gold", "red": "danger", "ok": "success",
+    }
+
+    def test_every_landing_colour_is_a_theme_token(self):
+        """Both theme blocks, every variable, equal to its token; and no colour
+        literal anywhere else in the sheet, except the ::backdrop scrims that
+        cannot read variables in Chromium 83 — those are token RGB with alpha."""
+        from theme_tokens import COLORS, DARK_COLORS
+
+        styles = (LANDING / "landing.css").read_text(encoding="utf-8").lower()
+        for opener, palette, olive_ink in (
+            (":root{", COLORS, "primary"),
+            ('html[data-theme="dark"]{', DARK_COLORS, "primary_muted"),
+        ):
+            block = styles.split(opener, 1)[1].split("}", 1)[0]
+            found = dict(re.findall(r"--([a-z-]+):(#[0-9a-f]{6})", block))
+            expected = {name: palette[token].lower() for name, token in self.TOKEN_MAP.items()}
+            expected["olive-ink"] = palette[olive_ink].lower()
+            self.assertEqual(expected, found, opener)
+
+        rest = re.sub(r"(:root|html\[data-theme=\"dark\"\])\{[^}]*\}", "", styles)
+        self.assertEqual([], re.findall(r"#[0-9a-f]{3,8}\b", rest))
+        tokens = {
+            tuple(int(value[i:i + 2], 16) for i in (1, 3, 5))
+            for value in list(COLORS.values()) + list(DARK_COLORS.values())
+        }
+        for rgb in re.findall(r"rgba?\((\d+),(\d+),(\d+)", rest):
+            self.assertIn(tuple(map(int, rgb)), tokens)
 
 
 class LandingDarkContrastTests(unittest.TestCase):

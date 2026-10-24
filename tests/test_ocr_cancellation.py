@@ -45,7 +45,9 @@ class OCRCancellationTests(unittest.TestCase):
             Image.new("RGB", (100, 140), "white").save(image_path)
 
             def progress(_fraction, _total, message=""):
-                return False if "tokens" in message else True
+                # The streaming status ("Đang đọc trang", "Đã xong k/n trang"),
+                # not the "Đang gửi ảnh" line sent before the first token.
+                return False if message.startswith(("Đang đọc trang", "Đã xong")) else True
 
             engine.process_document_chandra(str(image_path), progress_callback=progress)
 
@@ -62,7 +64,9 @@ class OCRCancellationTests(unittest.TestCase):
             pages = [Image.new("RGB", (100, 140), "white") for _ in range(3)]
 
             def progress(_fraction, _total, message=""):
-                return False if "tokens" in message else True
+                # The streaming status ("Đang đọc trang", "Đã xong k/n trang"),
+                # not the "Đang gửi ảnh" line sent before the first token.
+                return False if message.startswith(("Đang đọc trang", "Đã xong")) else True
 
             with patch("ocr_pipeline.render_pdf_adaptive", return_value=pages), \
                  patch("hardware_detect.detect_hardware", return_value=hardware), \

@@ -75,6 +75,18 @@ class UpdaterTests(unittest.TestCase):
         ]
         release_bundle.write_checksums(payload, self.patch / release_bundle.CHECKSUM_NAME)
 
+    def _installed_tree(self):
+        return {
+            path.relative_to(self.install).as_posix(): path.read_bytes()
+            for path in sorted(self.install.rglob("*")) if path.is_file()
+        }
+
+    def _backed_up_files(self):
+        backup = self.install / "backup"
+        if not backup.exists():
+            return []
+        return [path for path in backup.rglob("*") if path.is_file()]
+
     def test_a_valid_patch_replaces_the_application_layer(self):
         result = app_updater.apply_patch(self.patch, self.install)
 
@@ -178,6 +190,75 @@ class UpdaterTests(unittest.TestCase):
         self.assertTrue(any("database" in p for p in result.problems))
         self.assertEqual(
             b"user data", (self.install / "database" / "documents.db").read_bytes()
+        )
+
+    def test_operator_directories_are_matched_regardless_of_case(self):
+        """NTFS opens Database/documents.db as the real database/documents.db."""
+        (self.patch / "Database").mkdir()
+        (self.patch / "Database" / "documents.db").write_bytes(b"hostile")
+        self._sign_patch()
+        before = self._installed_tree()
+
+        result = app_updater.apply_patch(self.patch, self.install)
+
+        self.assertFalse(result.applied)
+        self.assertTrue(any("database" in p.lower() for p in result.problems))
+        self.assertEqual(before, self._installed_tree())
+        self.assertEqual([], self._backed_up_files())
+
+    def test_names_that_reach_operator_data_or_leave_the_install_are_refused(self):
+        for name in (
+            "database/documents.db",
+            "Database/documents.db",
+            "CONFIG/app_config.json",
+            "Backup/app-1/main.py",
+            "database./documents.db",   # Win32 drops trailing dots and spaces
+            "logs /ocr_app.log",
+            "../main.py",
+            "lib/../../main.py",
+            ".. /main.py",
+            "..\\main.py",
+            "/etc/passwd",
+            "\\\\server\\share\\main.py",
+            "C:/Windows/main.py",
+            "C:main.py",
+            "main.py:stream",
+        ):
+            with self.subTest(name=name):
+                self.assertIs(True, app_updater._is_protected(name))
+
+        for name in ("main.py", "frontend/app.js", "databases.py", "lib/database/x.py"):
+            with self.subTest(name=name):
+                self.assertIs(False, app_updater._is_protected(name))
+
+    def test_a_file_missing_from_the_checksum_listing_is_refused(self):
+        """verify_checksums only checks what SHA256SUMS lists, so anything else
+        on the media would be installed unverified."""
+        (self.patch / "llm_client.py").write_text("stale leftover\n", encoding="utf-8")
+        before = self._installed_tree()
+
+        result = app_updater.apply_patch(self.patch, self.install)
+
+        self.assertFalse(result.applied)
+        self.assertTrue(any("llm_client.py" in p for p in result.problems))
+        self.assertEqual(before, self._installed_tree())
+        self.assertEqual([], self._backed_up_files())
+
+    def test_the_manifest_must_be_covered_by_the_checksum_listing(self):
+        """It decides compatibility, so an unverified one decides nothing."""
+        release_bundle.write_checksums(
+            [self.patch / "main.py"], self.patch / release_bundle.CHECKSUM_NAME
+        )
+
+        result = app_updater.apply_patch(self.patch, self.install)
+
+        self.assertFalse(result.applied)
+        self.assertTrue(
+            any(release_bundle.MANIFEST_NAME in p for p in result.problems)
+        )
+        self.assertEqual(
+            "old application\n",
+            (self.install / "main.py").read_text(encoding="utf-8"),
         )
 
     def test_missing_checksums_are_refused_rather_than_trusted(self):

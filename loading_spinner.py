@@ -8,7 +8,7 @@ MainWindow heavy init the spinner briefly freezes; status text is updated
 before the block so the user sees context).
 
 Usage:
-    spinner = LoadingSpinner("icons/lucide/loader-2.svg", size=48, color="#00fbfb")
+    spinner = LoadingSpinner("icons/fluent/loader-2.svg", size=48, color="#00fbfb")
     layout.addWidget(spinner)
 """
 from pathlib import Path

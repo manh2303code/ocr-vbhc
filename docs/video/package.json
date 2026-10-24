@@ -1,0 +1,27 @@
+{
+  "name": "ocr-vbhc-readme-video",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Remotion source of the explainer videos shown in the OCR VBHC README",
+  "license": "UNLICENSED",
+  "type": "module",
+  "scripts": {
+    "studio": "remotion studio src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "render": "node scripts/render.mjs",
+    "render:mp4": "node scripts/render.mjs --only=mp4",
+    "render:gif": "node scripts/render.mjs --only=gif",
+    "render:poster": "node scripts/render.mjs --only=poster"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.533",
+    "@remotion/fonts": "4.0.533",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "remotion": "4.0.533"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.18",
+    "typescript": "5.9.3"
+  }
+}

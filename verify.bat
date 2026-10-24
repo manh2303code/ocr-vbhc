@@ -46,7 +46,7 @@ if not exist "runtime\python.exe" (
     echo [OK] runtime\python.exe
 )
 
-for %%f in (main.py startup_controller.py landing_data.py landing_page.py font_loader.py ui_commands.py workspace_layout.py main_window_1.py ocr_pipeline.py document_repository.py background_workers.py logging_config.py torch_compat.py verify_plan.py theme.qss theme_dark.qss frontend\landing\index.html frontend\landing\landing.css frontend\landing\landing.js frontend\landing\vendor\gsap.min.js assets\app_icon.ico assets\app_icon_256.png assets\fonts\BeVietnamPro-Regular.ttf assets\fonts\BeVietnamPro-Medium.ttf assets\fonts\BeVietnamPro-SemiBold.ttf assets\fonts\BeVietnamPro-Bold.ttf) do (
+for %%f in (main.py startup_controller.py landing_data.py landing_page.py font_loader.py ui_commands.py workspace_layout.py main_window_1.py editor_widgets.py ocr_pipeline.py document_repository.py background_workers.py chat_panel.py chat_widgets.py doc_resolver.py metadata_query.py answer_check.py logging_config.py torch_compat.py verify_plan.py tools\reocr_documents.py theme.qss theme_dark.qss frontend\landing\index.html frontend\landing\landing.css frontend\landing\landing.js assets\app_icon.ico assets\app_icon_256.png assets\fonts\BeVietnamPro-Regular.ttf assets\fonts\BeVietnamPro-Medium.ttf assets\fonts\BeVietnamPro-SemiBold.ttf assets\fonts\BeVietnamPro-Bold.ttf) do (
     if not exist "%%f" (
         echo [X] %%f - KHONG TIM THAY
         set /a ERRORS+=1

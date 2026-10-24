@@ -4,27 +4,28 @@ Lightweight status bar indicators — live system feedback.
 Performance:
 - Single QTimer (10s interval) drives all indicators — shared polling
 - Window-focus gated: skip polling when app inactive (saves CPU)
-- No nvidia-smi shell per indicator — one subprocess call, parsed once
-- Widgets: QLabel only (no custom paint, no repolish per update)
+- The probe (HTTP health + nvidia-smi) runs on a worker thread
+- Widgets: small QLabels and an 8px painted dot
+
+2026-10 minimal redesign: no "Chandra · Online" / "VRAM · –" strings on
+screen. Each indicator is a few separate quiet parts styled by the theme
+stylesheet (objectNames status_*), and says what it means in a tooltip.
+Indicators with nothing to report hide.
 
 Indicators exposed:
-- LlamaStatusIndicator — dot + "Chandra · Online/Offline"
-- VramIndicator       — compact bar + "4.2/8 GB" text
-- WorkerCountIndicator — "2 active" badge (hide when 0)
-- DocCountIndicator   — "57 văn bản"
+- LlamaStatusIndicator — dot + "Chandra" (+ "không phản hồi" when down)
+- VramIndicator        — thin bar + "4.2/8 GB"; hidden without nvidia-smi
+- WorkerCountIndicator — "2 tác vụ"; hidden when 0
 """
 from __future__ import annotations
 
 import logging
 import subprocess
-from pathlib import Path
 from typing import Optional
 
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal, QObject
-from PyQt5.QtGui import QColor, QPainter, QPen
-from PyQt5.QtWidgets import (
-    QWidget, QLabel, QHBoxLayout, QProgressBar, QSizePolicy,
-)
+from PyQt5.QtGui import QColor, QPainter
+from PyQt5.QtWidgets import QWidget, QLabel, QHBoxLayout, QProgressBar
 
 import httpx
 
@@ -61,173 +62,143 @@ class StatusProbeWorker(QThread):
         self.result_ready.emit(collect_status(self.server_url))
 
 
+def _token(name: str) -> str:
+    """A colour of the current theme (read at paint time, so a theme switch
+    needs no callback: the stylesheet change repaints every widget)."""
+    from theme_manager_v2 import ThemeManager
+    from theme_tokens import colors_for
+    return colors_for(ThemeManager.instance().current)[name]
+
+
+def _repolish(widget: QWidget) -> None:
+    """Re-read the stylesheet after a dynamic property changed."""
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
+
+
 # ── Dot widget (reusable) ──────────────────────────────────────────
 class _StatusDot(QWidget):
-    """8px colored dot painted in paintEvent. Change color via set_color."""
+    """A 6px dot in a theme token colour. Change it via set_token."""
 
-    def __init__(self, color: str = "#5F687C", parent: Optional[QWidget] = None):
+    def __init__(self, token: str = "text_muted", parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self._color = QColor(color)
-        self.setFixedSize(10, 10)
+        self._token = token
+        self.setFixedSize(8, 8)
 
-    def set_color(self, color: str) -> None:
-        self._color = QColor(color)
+    def set_token(self, token: str) -> None:
+        self._token = token
         self.update()
 
     def paintEvent(self, _event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        p.setBrush(self._color)
+        p.setBrush(QColor(_token(self._token)))
         p.setPen(Qt.NoPen)
-        p.drawEllipse(1, 1, 8, 8)
+        p.drawEllipse(1, 1, 6, 6)
         p.end()
 
 
-# ── Llama-server indicator ─────────────────────────────────────────
+# ── OCR server indicator ───────────────────────────────────────────
 class LlamaStatusIndicator(QWidget):
-    """Green/red dot + 'Chandra · Online/Offline' text."""
+    """The Chandra OCR server: a dot and its name.
+
+    The dot is green while the server answers, red when it does not, grey
+    while the first check runs. The state is spelled out in the tooltip,
+    and on screen only when something is wrong.
+    """
+
+    # online -> (dot token, words on screen, tooltip)
+    STATES = {
+        None: ("text_muted", "", "Máy chủ OCR Chandra\nĐang kiểm tra"),
+        True: ("success", "", "Máy chủ OCR Chandra\nĐang chạy"),
+        False: ("danger", "không phản hồi", "Máy chủ OCR Chandra\nKhông phản hồi"),
+    }
 
     def __init__(self, server_url: str = "http://127.0.0.1:9999",
                  parent: Optional[QWidget] = None):
         super().__init__(parent)
         self._url = server_url
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(4, 2, 4, 2)
-        layout.setSpacing(6)
-        self._dot = _StatusDot("#5F687C")
-        self._label = QLabel("Chandra · Đang kiểm tra")
-        self._label.setStyleSheet("color: #6B7280; font-size: 9pt;")
+        layout.setContentsMargins(10, 0, 4, 0)
+        layout.setSpacing(5)
+        self._dot = _StatusDot()
+        self._label = QLabel("Chandra")
+        self._label.setObjectName("status_llama")
+        self._state = QLabel("")
+        self._state.setObjectName("status_llama_state")
         layout.addWidget(self._dot)
         layout.addWidget(self._label)
-        layout.addStretch()
+        layout.addWidget(self._state)
+        self.set_online(None)
 
-    def refresh(self) -> None:
-        """Quick health check. Non-blocking — uses short 1s timeout."""
-        try:
-            r = httpx.get(f"{self._url}/health", timeout=1.0)
-            if r.status_code == 200:
-                self._dot.set_color("#16A34A")
-                self._label.setText("Chandra · Online")
-                self._label.setStyleSheet("color: #16A34A; font-size: 9pt; font-weight: 500;")
-                return
-        except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout):
-            pass
-        except Exception as e:
-            logger.debug(f"LlamaStatus refresh error: {e}")
-        # Offline/unreachable
-        self._dot.set_color("#DC2626")
-        self._label.setText("Chandra · Offline")
-        self._label.setStyleSheet("color: #DC2626; font-size: 9pt;")
-
-    def set_online(self, online: bool) -> None:
-        self._dot.set_color("#16A34A" if online else "#DC2626")
-        self._label.setText(f"Chandra · {'Online' if online else 'Offline'}")
-        self._label.setStyleSheet(
-            f"color: {'#16A34A' if online else '#DC2626'}; font-size: 9pt;"
-            + (" font-weight: 500;" if online else "")
-        )
+    def set_online(self, online) -> None:
+        token, words, tip = self.STATES[None if online is None else bool(online)]
+        self._dot.set_token(token)
+        self._state.setText(words)
+        self._state.setVisible(bool(words))
+        self.setToolTip(tip)
 
 
 # ── VRAM indicator ─────────────────────────────────────────────────
 class VramIndicator(QWidget):
-    """Compact bar + text '4.2/8 GB VRAM'. Uses nvidia-smi."""
+    """GPU memory: a thin bar and "4.2/8 GB"; "VRAM" and the percentage are
+    in the tooltip. Hidden until nvidia-smi answers."""
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setContentsMargins(10, 0, 4, 0)
         layout.setSpacing(6)
         self._bar = QProgressBar()
+        self._bar.setObjectName("status_vram_bar")
         self._bar.setRange(0, 100)
         self._bar.setValue(0)
-        self._bar.setFixedSize(50, 6)
+        self._bar.setFixedSize(40, 4)
         self._bar.setTextVisible(False)
-        self._bar.setStyleSheet(
-            "QProgressBar { background: #D8D1C3; border: none; border-radius: 2px; }"
-            "QProgressBar::chunk { background: #24432D; border-radius: 2px; }"
-        )
-        self._label = QLabel("VRAM · –")
-        self._label.setStyleSheet("color: #6B7280; font-size: 9pt;")
-        layout.addWidget(self._bar)
+        self._label = QLabel("")
+        self._label.setObjectName("status_vram")
+        layout.addWidget(self._bar, 0, Qt.AlignVCenter)
         layout.addWidget(self._label)
-        layout.addStretch()
-
-    def refresh(self) -> None:
-        """Query nvidia-smi. ~30ms subprocess. Skip if unavailable."""
-        try:
-            result = subprocess.run(
-                ["nvidia-smi", "--query-gpu=memory.used,memory.total",
-                 "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=2, creationflags=0x08000000
-            )
-            if result.returncode != 0:
-                self._label.setText("VRAM · n/a")
-                return
-            # Parse: "1234, 8188"
-            line = result.stdout.strip().split("\n")[0]
-            used, total = (int(x.strip()) for x in line.split(","))
-            pct = int(100 * used / total) if total > 0 else 0
-            self._bar.setValue(pct)
-            gb_used = used / 1024
-            gb_total = total / 1024
-            self._label.setText(f"VRAM · {gb_used:.1f}/{gb_total:.0f} GB")
-            # Color threshold
-            if pct >= 85:
-                color = "#DC2626"  # red
-            elif pct >= 60:
-                color = "#D97706"  # amber
-            else:
-                color = "#24432D"  # olive
-            self._bar.setStyleSheet(
-                "QProgressBar { background: #D8D1C3; border: none; border-radius: 2px; }"
-                f"QProgressBar::chunk {{ background: {color}; border-radius: 2px; }}"
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            self._label.setText("VRAM · n/a")
-        except Exception as e:
-            logger.debug(f"VRAM refresh error: {e}")
+        self.setVisible(False)
 
     def set_usage(self, usage) -> None:
         if not usage:
-            self._bar.setValue(0)
-            self._label.setText("VRAM · n/a")
+            self.setVisible(False)
             return
         used, total = usage
         pct = int(100 * used / total) if total else 0
         self._bar.setValue(pct)
-        self._label.setText(f"VRAM · {used / 1024:.1f}/{total / 1024:.0f} GB")
-        color = "#DC2626" if pct >= 85 else "#D97706" if pct >= 60 else "#24432D"
-        self._bar.setStyleSheet(
-            "QProgressBar { background: #D8D1C3; border: none; border-radius: 2px; }"
-            f"QProgressBar::chunk {{ background: {color}; border-radius: 2px; }}"
+        level = "high" if pct >= 85 else "mid" if pct >= 60 else "low"
+        if self._bar.property("level") != level:
+            self._bar.setProperty("level", level)
+            _repolish(self._bar)
+        self._label.setText(f"{used / 1024:.1f}/{total / 1024:.0f} GB")
+        self.setToolTip(
+            f"Bộ nhớ GPU (VRAM) đang dùng\n{used / 1024:.1f} trên {total / 1024:.0f} GB, {pct}%"
         )
+        self.setVisible(True)
 
 
 # ── Worker count indicator ─────────────────────────────────────────
 class WorkerCountIndicator(QWidget):
-    """'N active' badge. Callable set_count(n) from worker lifecycle hooks."""
+    """'N tác vụ' while background work runs; hidden when there is none."""
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setContentsMargins(10, 0, 4, 0)
         layout.setSpacing(4)
         self._count = 0
         self._label = QLabel("")
-        self._label.setStyleSheet("color: #6B7280; font-size: 9pt;")
+        self._label.setObjectName("status_workers")
         layout.addWidget(self._label)
-        layout.addStretch()
+        self.setToolTip("Số tác vụ nền đang chạy, ví dụ OCR hoặc lập chỉ mục")
+        self.setVisible(False)
 
     def set_count(self, n: int) -> None:
         self._count = n
-        if n <= 0:
-            self._label.setText("")
-        elif n == 1:
-            self._label.setText("1 tác vụ")
-            self._label.setStyleSheet("color: #D97706; font-size: 9pt; font-weight: 500;")
-        else:
-            self._label.setText(f"{n} tác vụ")
-            self._label.setStyleSheet("color: #D97706; font-size: 9pt; font-weight: 500;")
+        self._label.setText(f"{n} tác vụ" if n > 0 else "")
+        self.setVisible(n > 0)
 
 
 # ── Coordinator: single timer, refreshes all ───────────────────────
@@ -250,8 +221,8 @@ class StatusIndicatorCoordinator(QObject):
         self._worker = None
 
     def register(self, indicator) -> None:
-        """Register any widget with a refresh() method."""
-        if hasattr(indicator, "refresh"):
+        """Register a widget with set_online() and/or set_usage()."""
+        if hasattr(indicator, "set_online") or hasattr(indicator, "set_usage"):
             self._indicators.append(indicator)
 
     def start(self) -> None:

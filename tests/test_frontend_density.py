@@ -3,13 +3,14 @@ import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtGui import QPalette
+from PyQt5.QtGui import QPalette, QTextFormat
 from PyQt5.QtWidgets import QApplication, QFrame, QLabel, QSplitter, QWidget
 
 from analytics_dialog import AnalyticsDialog
 from display_html_renderer import build_display_html
 from main_window_1 import OCRResultEditor
 from theme_manager_v2 import ThemeManager
+from theme_tokens import COLORS, DARK_COLORS, colors_for
 
 
 class FrontendDensityTests(unittest.TestCase):
@@ -17,20 +18,30 @@ class FrontendDensityTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
-    def test_editor_uses_one_compact_typography_system(self):
+    def test_editor_sets_document_content_in_times_and_chrome_in_sans(self):
+        """2026-10 brief: the full text and the metadata values read like the
+        paper (Times New Roman, 10.5-11pt); labels and controls stay sans.
+        Still compact: a one-line value is one line high, the action bar thin."""
+        ThemeManager.instance().apply(self.app, "light")
         editor = OCRResultEditor(db=None)
+        editor.resize(420, 900)
+        editor.show()
+        self.app.processEvents()
         rendered = build_display_html('<div data-label="Text"><p>Nội dung OCR</p></div>')
 
-        self.assertIn("Be Vietnam Pro", rendered)
-        self.assertNotIn("Times New Roman", rendered)
-        self.assertEqual("Be Vietnam Pro", editor.fields["so_ki_hieu"].font().family())
-        self.assertEqual("Be Vietnam Pro", editor.fields["van_ban_dang_txt"].font().family())
-        self.assertLessEqual(editor.fields["so_ki_hieu"].font().pointSizeF(), 9.0)
-        self.assertLessEqual(editor.fields["so_ki_hieu"].maximumHeight(), 26)
-        self.assertLessEqual(editor.scroll_area.maximumHeight(), 370)
-        self.assertGreaterEqual(editor.scroll_area.minimumHeight(), 230)
+        self.assertIn("Times New Roman", rendered)
+        self.assertNotIn("Be Vietnam Pro", rendered)
+        for key in ("so_ki_hieu", "cqbh", "nd_chinh", "do_khan", "van_ban_dang_txt"):
+            font = editor.fields[key].font()
+            self.assertEqual("Times New Roman", font.family(), key)
+            self.assertGreaterEqual(font.pointSizeF(), 10.5, key)
+            self.assertLessEqual(font.pointSizeF(), 11.0, key)
+        label = editor._metadata_labels["Số hiệu"]
+        self.assertEqual("Be Vietnam Pro", label.font().family())
+        self.assertLessEqual(label.font().pointSizeF(), 9.0)
+        self.assertLessEqual(editor.fields["so_ki_hieu"].height(), 30)
         self.assertLessEqual(editor.findChild(QFrame, "ocr_action_bar").height(), 46)
-        editor.deleteLater()
+        editor.close()
 
     def test_loading_document_returns_metadata_to_top(self):
         editor = OCRResultEditor(db=None)
@@ -51,26 +62,37 @@ class FrontendDensityTests(unittest.TestCase):
         editor.close()
 
     def test_dark_theme_recolors_cached_ocr_html(self):
+        """The cached OCR HTML carries no text colour of its own, so the text
+        takes the widget's token colour in either theme; the header number is
+        the gold mark of the theme."""
+        manager = ThemeManager.instance()
+        manager.apply(self.app, "light")
         editor = OCRResultEditor(db=None)
+        editor.show()
         editor.load_data((
             1, 9, 1, "Cơ quan", "", "01/CV", "11/07/2026", "Không", "Không",
             "Công văn", "Nội dung chính", "Nơi nhận", "Chức vụ", "Người ký",
             '<div data-label="Text"><p>Nội dung OCR tiếng Việt</p></div>',
             "OCR System", "2026-07-11 10:00:00", "chandra-q4",
         ))
+        ocr = editor.fields["van_ban_dang_txt"]
 
-        editor.apply_theme("dark")
-        cursor = editor.fields["van_ban_dang_txt"].document().find("Nội dung OCR")
-        self.assertFalse(cursor.isNull())
-        self.assertEqual("#e8ebf5", cursor.charFormat().foreground().color().name())
-        self.assertIn("#E5C466", editor._file_label.text())
-        self.assertNotIn("#17231b", build_display_html(
-            '<div data-label="Text"><p>Nội dung OCR</p></div>'
-        ).lower())
-        editor.apply_theme("light")
-        cursor = editor.fields["van_ban_dang_txt"].document().find("Nội dung OCR")
-        self.assertEqual("#17231b", cursor.charFormat().foreground().color().name())
-        editor.deleteLater()
+        for theme in ("dark", "light"):
+            manager.apply(self.app, theme)
+            self.app.processEvents()
+            tokens = colors_for(theme)
+            cursor = ocr.document().find("Nội dung OCR")
+            self.assertFalse(cursor.isNull())
+            self.assertFalse(cursor.charFormat().hasProperty(QTextFormat.ForegroundBrush))
+            self.assertEqual(tokens["text"].lower(), ocr.palette().color(QPalette.Text).name())
+            number = editor._doc_number_label
+            self.assertEqual("01/CV", number.full_text())
+            self.assertEqual(tokens["accent_gold"].lower(),
+                             number.palette().color(QPalette.WindowText).name())
+        rendered = build_display_html('<div data-label="Text"><p>Nội dung OCR</p></div>').lower()
+        self.assertNotIn(COLORS["text"].lower(), rendered)
+        self.assertNotIn(DARK_COLORS["text"].lower(), rendered)
+        editor.close()
 
     def test_metadata_form_spacing_and_text_areas_fit_content(self):
         ThemeManager.instance().apply(self.app, "light")
@@ -88,17 +110,28 @@ class FrontendDensityTests(unittest.TestCase):
         form = editor.findChild(QWidget, "ocrMetadataForm")
         self.assertIsNotNone(form)
         self.assertEqual("ocrMetadataScroll", editor.scroll_area.objectName())
-        self.assertLessEqual(editor.fields["so_ki_hieu"].height(), 24)
+        self.assertLessEqual(editor.fields["so_ki_hieu"].height(), 30)
+        # Multi-line values are as tall as their lines, all of them visible.
         self.assertLess(editor.fields["nd_chinh"].height(), editor.fields["noi_nhan"].height())
-        self.assertLessEqual(editor.fields["noi_nhan"].height(), 68)
+        self.assertFalse(editor.fields["noi_nhan"].is_capped())
 
         labels = {
             label.text(): label for label in form.findChildren(QLabel)
             if label.property("role") == "metadataLabel"
         }
-        first_bottom = editor.fields["so_ki_hieu"].geometry().bottom()
-        self.assertGreaterEqual(labels["Độ khẩn"].geometry().top() - first_bottom, 5)
-        self.assertNotIn("color:", labels["Số hiệu"].styleSheet().lower())
+        # Rows never overlap, with air between them, in the order of the paper.
+        rows = ("cqbh", "so_ki_hieu", "ngay_bh", "do_khan", "do_mat", "loai_vb",
+                "nd_chinh", "noi_nhan", "chuc_vu", "chu_ky")
+        for upper, lower in zip(rows, rows[1:]):
+            gap = (editor.fields[lower].geometry().top()
+                   - editor.fields[upper].geometry().bottom())
+            self.assertGreaterEqual(gap, 3, (upper, lower))
+        # A label sits on the line of its value, never on another row.
+        for text, key in (("Số hiệu", "so_ki_hieu"), ("Độ khẩn", "do_khan")):
+            value = editor.fields[key].geometry()
+            label_top = labels[text].mapTo(form, labels[text].rect().topLeft()).y()
+            self.assertLessEqual(abs(label_top - value.top()), 6, text)
+        self.assertEqual("", labels["Số hiệu"].styleSheet())
         editor.close()
 
     def test_analytics_sidebar_and_rows_are_laptop_compact(self):
@@ -116,6 +149,10 @@ class FrontendDensityTests(unittest.TestCase):
         dialog.deleteLater()
 
     def test_analytics_palette_remains_readable_in_both_themes(self):
+        """Opened in the dark theme, then switched live to the light one.
+        The switch goes through the ThemeManager as in the app: the colours
+        come from the generated stylesheet now, not from a palette the
+        dialog used to set on every child by itself."""
         manager = ThemeManager.instance()
         manager.apply(self.app, "dark")
         dialog = AnalyticsDialog(db=None)
@@ -127,7 +164,7 @@ class FrontendDensityTests(unittest.TestCase):
         self.assertLess(self._luminance(dark_base), 0.2)
         self.assertGreaterEqual(self._contrast(dark_base, dark_text), 4.5)
 
-        dialog.apply_theme("light")
+        manager.apply(self.app, "light")
         self.app.processEvents()
         light_base = dialog.results_table.palette().color(QPalette.Base)
         light_text = dialog.results_table.palette().color(QPalette.Text)

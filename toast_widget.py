@@ -1,8 +1,17 @@
 """
-Lightweight toast notification widget — non-blocking alerts.
+Lightweight toast notifications — non-blocking alerts.
+
+A toast is a small floating surface: the kind as a Fluent icon in its token
+colour (success, danger, warning; info in the quiet secondary tone), the
+message in the text colour, up to two lines, the rest in the tooltip. Like
+the other floating parts of the 2026-10 redesign it is the surface colour
+with a border_strong hairline and the 6px popover radius, no tinted fill and
+no shadow; the surface comes from the stylesheet ("AREA: dialogs" in
+devtools/theme_template.qss), the icon from theme_tokens, recoloured on
+ThemeManager.theme_changed.
 
 Performance:
-- 2 widgets per toast (QFrame + QLabel)
+- 3 widgets per toast (QFrame + 2 QLabel)
 - Stack managed centrally, no polling
 - Auto-dismiss via QTimer (one-shot per toast)
 - Fade-out animation on dismiss
@@ -23,93 +32,95 @@ import logging
 from typing import Optional
 
 from PyQt5.QtCore import (
-    Qt, QTimer, QPropertyAnimation, QEasingCurve, QPoint, QSize,
+    Qt, QTimer, QPropertyAnimation, QEasingCurve,
 )
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QFontMetrics, QTextLayout
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QFrame, QHBoxLayout, QGraphicsOpacityEffect,
 )
 
+import theme_tokens
+from ui_icons import icon
+
 logger = logging.getLogger("Toast")
 
 
+# kind -> (Fluent icon, token that colours it)
 TOAST_CONFIGS = {
-    "success": {
-        "bg": "#F0FDF4",
-        "border": "#16A34A",
-        "text": "#14532D",
-        "icon": "✓",
-    },
-    "error": {
-        "bg": "#FEF2F2",
-        "border": "#DC2626",
-        "text": "#7F1D1D",
-        "icon": "✕",
-    },
-    "warning": {
-        "bg": "#FFFBEB",
-        "border": "#D97706",
-        "text": "#78350F",
-        "icon": "⚠",
-    },
-    "info": {
-        "bg": "#EFF6FF",
-        "border": "#1E3924",
-        "text": "#0F2B5B",
-        "icon": "i",
-    },
+    "success": {"icon": "check-circle", "token": "success"},
+    "error": {"icon": "circle-alert", "token": "danger"},
+    "warning": {"icon": "warning", "token": "warning"},
+    "info": {"icon": "info", "token": "text_secondary"},
 }
+
+
+def _current_theme() -> str:
+    try:
+        from theme_manager_v2 import ThemeManager
+        return ThemeManager.instance().current
+    except Exception:
+        return "light"
+
+
+def _two_lines(text: str, font, width: int) -> str:
+    """The text as it fits in two wrapped lines, the second ending in "…"
+    when there is more."""
+    layout = QTextLayout(text, font)
+    layout.beginLayout()
+    starts = []
+    while True:
+        line = layout.createLine()
+        if not line.isValid():
+            break
+        line.setLineWidth(width)
+        starts.append(line.textStart())
+    layout.endLayout()
+    if len(starts) <= 2:
+        return text
+    second = starts[1]
+    return text[:second] + QFontMetrics(font).elidedText(text[second:], Qt.ElideRight, width)
 
 
 class Toast(QFrame):
     """Single toast — self-dismissing with fade-out."""
 
-    WIDTH = 320
-    HEIGHT = 48
+    WIDTH = 340
+    HEIGHT = 56
     MARGIN = 16
+    ICON_SIZE = 18
 
     def __init__(self, parent: QWidget, message: str, kind: str = "info",
                  duration_ms: int = 5000):
         super().__init__(parent)
-        cfg = TOAST_CONFIGS.get(kind, TOAST_CONFIGS["info"])
-        self._kind = kind
+        self.setObjectName("toast")
+        self._kind = kind if kind in TOAST_CONFIGS else "info"
         self.setFixedSize(self.WIDTH, self.HEIGHT)
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setStyleSheet(f"""
-            Toast {{
-                background: {cfg['bg']};
-                border: 1px solid {cfg['border']};
-                border-left: 4px solid {cfg['border']};
-                border-radius: 6px;
-            }}
-        """)
+        self.setProperty("kind", self._kind)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(10)
 
-        # Icon glyph (unicode — no SVG overhead for a decorative mark)
-        icon_label = QLabel(cfg["icon"])
-        icon_label.setFixedSize(20, 20)
-        icon_label.setAlignment(Qt.AlignCenter)
-        icon_label.setStyleSheet(
-            f"color: {cfg['border']}; font-weight: 700; font-size: 14pt;"
-            f" background: transparent;"
-        )
-        layout.addWidget(icon_label)
+        self._icon_label = QLabel()
+        self._icon_label.setFixedSize(self.ICON_SIZE, self.ICON_SIZE)
+        layout.addWidget(self._icon_label, 0, Qt.AlignVCenter)
 
-        # Message — single line, truncated
-        msg_label = QLabel(message)
-        msg_label.setStyleSheet(
-            f"color: {cfg['text']}; font-size: 10pt; background: transparent;"
-        )
-        msg_label.setWordWrap(False)
-        # Qt elides text automatically with .setTextElideMode on itemview;
-        # QLabel truncates via width + setSizePolicy. We cap message length.
-        if len(message) > 60:
-            msg_label.setText(message[:57] + "...")
-            msg_label.setToolTip(message)
-        layout.addWidget(msg_label, 1)
+        # The message wraps to two lines; anything longer is in the tooltip.
+        self._message = message
+        self._msg_label = QLabel()
+        self._msg_label.setObjectName("toastMessage")
+        self._msg_label.setTextFormat(Qt.PlainText)
+        self._msg_label.setWordWrap(True)
+        layout.addWidget(self._msg_label, 1)
+        self._fit_message()
+
+        self._apply_theme()
+        try:
+            from theme_manager_v2 import ThemeManager
+            ThemeManager.instance().theme_changed.connect(self.apply_theme)
+        except Exception as exc:
+            logger.debug(f"Theme signal unavailable: {exc}")
 
         # Opacity effect for fade-in/out
         self._opacity = QGraphicsOpacityEffect(self)
@@ -125,11 +136,35 @@ class Toast(QFrame):
         self._dismiss_timer.timeout.connect(self._dismiss)
         self._duration_ms = duration_ms
 
+    def _fit_message(self) -> None:
+        self._msg_label.ensurePolished()
+        margins = self.layout().contentsMargins()
+        # A pixel or two short of the label, so its own wrapping never
+        # needs a third line for what was measured as two.
+        width = (self.WIDTH - margins.left() - margins.right()
+                 - self.ICON_SIZE - self.layout().spacing() - 2)
+        shown = _two_lines(self._message, self._msg_label.font(), width)
+        self._msg_label.setText(shown)
+        self.setToolTip(self._message if shown != self._message else "")
+
+    def _apply_theme(self) -> None:
+        """The kind's icon in its token colour; the surface and the text
+        colour are the stylesheet's."""
+        config = TOAST_CONFIGS[self._kind]
+        colour = theme_tokens.colors_for(_current_theme())[config["token"]]
+        self._icon_label.setPixmap(
+            icon(config["icon"], self.ICON_SIZE, colour).pixmap(self.ICON_SIZE, self.ICON_SIZE))
+
+    def apply_theme(self, name: str = "") -> None:
+        """Public hook called on ThemeManager.theme_changed."""
+        self._apply_theme()
+
     def show_at(self, x: int, y: int) -> None:
         """Display at parent coords + start auto-dismiss timer."""
         self.move(x, y)
         self.show()
         self.raise_()
+        self._fit_message()  # the stylesheet's font is known once shown
         # Fade in
         self._fade_anim.stop()
         self._fade_anim.setStartValue(0.0)
@@ -167,6 +202,7 @@ class ToastManager:
 
     _instance: Optional["ToastManager"] = None
     MAX_VISIBLE = 5
+    GAP = 8
 
     def __init__(self):
         self._stacks: dict = {}  # parent QWidget → list[Toast]
@@ -198,9 +234,7 @@ class ToastManager:
         x = parent.width() - Toast.WIDTH - Toast.MARGIN
         y = parent.height() - Toast.MARGIN - Toast.HEIGHT
         # Offset by each existing toast's height + gap
-        gap = 8
-        for i, existing in enumerate(stack[:-1]):  # exclude the new one
-            y -= (Toast.HEIGHT + gap)
+        y -= (len(stack) - 1) * (Toast.HEIGHT + self.GAP)
 
         toast.show_at(x, y)
         return toast
@@ -220,9 +254,8 @@ class ToastManager:
             return
         x = parent.width() - Toast.WIDTH - Toast.MARGIN
         y_start = parent.height() - Toast.MARGIN - Toast.HEIGHT
-        gap = 8
         for i, t in enumerate(stack):
-            y = y_start - i * (Toast.HEIGHT + gap)
+            y = y_start - i * (Toast.HEIGHT + self.GAP)
             t.move(x, y)
 
 
